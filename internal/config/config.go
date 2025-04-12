@@ -33,6 +33,7 @@ type Config struct {
 	HTTPSCertFile           string              // Path to the HTTPS certificate file
 	HTTPSKeyFile            string              // Path to the HTTPS private key file
 	HTTPSAddress            string              // The address to listen on for HTTPS
+	ExternalURL             string              // The external URL for the CA service
 	// Add other configuration options here later
 }
 
@@ -77,6 +78,7 @@ const (
 	defaultHTTPSCertFile       = "./data/https.crt"
 	defaultHTTPSKeyFile        = "./data/https.key"
 	defaultHTTPSAddress        = ":8443"
+	defaultExternalURL         = "https://localhost:8443"
 )
 
 var defaultAPIKeys = map[string]APIKey{
@@ -123,6 +125,7 @@ func LoadConfig() (*Config, error) {
 		HTTPSCertFile:           getEnv("CAFOUNDRY_HTTPS_CERT_FILE", defaultHTTPSCertFile),
 		HTTPSKeyFile:            getEnv("CAFOUNDRY_HTTPS_KEY_FILE", defaultHTTPSKeyFile),
 		HTTPSAddress:            getEnv("CAFOUNDRY_HTTPS_ADDRESS", defaultHTTPSAddress),
+		ExternalURL:             getEnv("CAFOUNDRY_EXTERNAL_URL", defaultExternalURL),
 	}
 	// Add more configuration loading logic here later
 	return cfg, nil

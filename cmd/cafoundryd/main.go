@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/blockadesystems/cafoundry/internal/acme"
 	"github.com/blockadesystems/cafoundry/internal/ca"
 	"github.com/blockadesystems/cafoundry/internal/config"
 	"github.com/blockadesystems/cafoundry/internal/storage"
@@ -85,9 +86,41 @@ func main() {
 	e.HideBanner = true
 	e.Use(middleware.Recover())
 
+	// Middle to pass caService, cfg, and store to handlers
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Set("caService", caService)
+			c.Set("cfg", cfg)
+			c.Set("store", store)
+			return next(c)
+		}
+	})
+
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "CA Foundry is running!")
 	})
+
+	// ACME protocol endpoints
+	acmeGroup := e.Group("/acme")
+	acmeGroup.GET("/directory", acme.HandleDirectory)            // Directory endpoint
+	acmeGroup.GET("/new-nonce", acme.HandleNewNonce)             // Nonce endpoint
+	acmeGroup.HEAD("/new-nonce", acme.HandleNewNonce)            // Nonce endpoint (HEAD method)
+	acmeGroup.POST("/new-account", acme.HandleNewAccount)        // Account creation
+	acmeGroup.POST("/account/:accountID", acme.HandleAccount)    // Account management
+	acmeGroup.POST("/new-order", acme.HandleNewOrder)            // Order creation
+	acmeGroup.GET("/order/:orderID", acme.HandleGetOrder)        // Order status/management
+	acmeGroup.POST("/authz/:authzID", acme.HandleAuthorization)  // Authorization objects
+	acmeGroup.POST("/chall/:challengeID", acme.HandleChallenge)  // Challenge objects
+	acmeGroup.POST("/finalize/:orderID", acme.HandleFinalize)    // Order finalization
+	acmeGroup.GET("/cert/:certID", acme.HandleCertificate)       // Certificate download
+	acmeGroup.POST("/revoke-cert", acme.HandleRevokeCertificate) // Certificate revocation
+
+	// CA Foundry specific endpoints
+	// apiGroup := e.Group("/api")
+	// apiGroup.GET("/health", s.handleHealth)		// Health/status endpoint
+	// apiGroup.GET("/ca-chain", s.handleCAChain)	// CA certificate chain endpoint
+	// apiGroup.POST("/ocsp", s.handleOCSP)		// OCSP endpoint
+	// apiGroup.GET("/crl", s.handleCRL)			// CRL distribution endpoint
 
 	address := cfg.HTTPSAddress
 	logger.Info("listening on address", zap.String("address", address))

@@ -11,7 +11,7 @@ import (
 	// "path/filepath"
 	"time"
 
-	"github.com/blockadesystems/cafoundry/internal/model"
+	// "github.com/blockadesystems/cafoundry/internal/model"
 	_ "github.com/lib/pq" // Import the PostgreSQL driver
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -52,9 +52,6 @@ type Storage interface {
 	UpdateUser(username string, password string, roles []string) error
 	DeleteUser(username string) error
 	ListUsers() (map[string][]string, error)
-	// ACME methods
-	SaveACMEAccount(account model.ACMEAccount) error
-	GetACMEAccount(key interface{}) (model.ACMEAccount, error)
 	// Add other storage methods as needed
 }
 
@@ -216,37 +213,6 @@ func NewPostgreSQLStorage(dbHost string, dbUser string, dbPassword string, dbNam
 	}
 	logger.Info("PostgreSQLStorage initialized", zap.String("host", dbHost), zap.String("user", dbUser), zap.String("dbname", dbName), zap.Int("port", dbPort))
 	return s, nil
-}
-
-// SaveACMEAccount saves an ACME account to the PostgreSQL database.
-func (s *PostgreSQLStorage) SaveACMEAccount(account model.ACMEAccount) error { // Use model.ACMEAccount
-	_, err := s.db.ExecContext(context.Background(),
-		"INSERT INTO acme_accounts (email, private_key, uri, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET email = $1, private_key = $2, uri = $3, created_at = $4",
-		account.Email, account.PrivateKey, account.URI, account.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("storage: failed to save ACME account: %w", err)
-	}
-	logger.Info("ACME account saved to database", zap.Int64("id", account.ID), zap.String("email", account.Email))
-	return nil
-}
-
-// GetACMEAccount retrieves an ACME account from the PostgreSQL database.
-func (s *PostgreSQLStorage) GetACMEAccount(key interface{}) (model.ACMEAccount, error) { // Use model.ACMEAccount
-	// In this MVP, we're not using the key yet.
-	// You'll likely want to implement more sophisticated key-based retrieval later.
-	row := s.db.QueryRowContext(context.Background(), "SELECT id, email, private_key, uri, created_at FROM acme_accounts LIMIT 1") // Get the first account
-	var account model.ACMEAccount                                                                                                  // Use model.ACMEAccount
-	err := row.Scan(&account.ID, &account.Email, &account.PrivateKey, &account.URI, &account.CreatedAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			logger.Info("no ACME account found in database")
-			return model.ACMEAccount{}, nil // Return an empty account and no error
-		}
-		return model.ACMEAccount{}, fmt.Errorf("storage: failed to get ACME account: %w", err)
-	}
-	logger.Info("ACME account retrieved from database", zap.Int64("id", account.ID), zap.String("email", account.Email))
-	return account, nil
 }
 
 // SaveCertificate saves a certificate to the PostgreSQL database.
