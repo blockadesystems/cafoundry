@@ -131,3 +131,73 @@ export CAFOUNDRY_HTTPS_ADDRESS=":8443"
 export CAFOUNDRY_HTTP_ADDRESS=":8080"
 export CAFOUNDRY_COMMON_NAME="My Internal CA"
 # Add others as needed
+```
+
+Running
+
+Ensure all required environment variables are set, then run the compiled binary:
+```Bash
+
+./cafoundryd
+```
+
+The server will start listening on the configured HTTP and HTTPS addresses. Check the logs for confirmation and any errors.
+
+Usage with ACME Clients
+
+CA Foundry is designed to work with standard ACME v2 clients like Certbot, acme.sh, etc.
+
+Important:
+
+    Trust: The client machine (and any machine that needs to trust certificates issued by CA Foundry) must be configured to trust the CA Foundry root certificate. This certificate (ca.crt) is typically generated and stored in the location derived from CAFOUNDRY_DATA_DIR by the CA service on its first run if not found in the database, although the primary source is the database (GetCACertificate). You will need to retrieve this certificate and add it to the system or application trust stores.
+    Server URL: Point your ACME client to the CA Foundry directory URL, which is {CAFOUNDRY_EXTERNAL_URL}/acme/directory.
+
+Example using Certbot (Standalone mode, HTTP-01 challenge):
+
+
+# 1. Make sure CA Foundry is running and accessible at CAFOUNDRY_EXTERNAL_URL.
+# 2. Obtain the CA Foundry root certificate (e.g., ca.crt) and save it.
+# 3. Run Certbot:
+
+```bash
+sudo certbot certonly \
+    --standalone \
+    --preferred-challenges http \
+    --server [https://your-cafoundry-host.internal:8443/acme/directory](https://your-cafoundry-host.internal:8443/acme/directory) \
+    --cert-path /tmp/cafoundry-cert.pem \
+    --key-path /tmp/cafoundry-key.pem \
+    --fullchain-path /tmp/cafoundry-fullchain.pem \
+    -d myapp.yourdomain.internal \
+    -d anotherapp.yourdomain.internal \
+    --email your-admin@yourdomain.internal \
+    --agree-tos \
+    --non-interactive \
+    --debug \
+    --logs-dir /tmp/certbot-logs \
+    --config-dir /tmp/certbot-config \
+    --work-dir /tmp/certbot-work \
+    --cacert /path/to/your/cafoundry-ca.crt # Tell certbot to trust your CA
+
+# Check /tmp/ for the issued certificate files.
+```
+
+Adjust domains, email, server URL, and --cacert path accordingly.
+Using --standalone requires ports 80/443 to be free or Certbot needs alternate ports configured.
+You might need to use --no-verify-ssl initially if the HTTPS certificate for CA Foundry itself is self-signed.
+
+TODO / Future Work
+
+    Comprehensive Testing: Unit tests and integration tests (e.g., using Pebble).
+    Policy Enforcement: Implement robust domain allow/block lists, key type restrictions in ca.SignCSR.
+    CAA Checking: Add mandatory DNS CAA record checks.
+    Rate Limiting: Implement ACME rate limits.
+    CRL/OCSP Serving: Implement actual endpoints to serve CRLs and potentially OCSP responses. Add periodic CRL generation.
+    ACME Edge Cases: Handle authorization deactivation, key change requests.
+    Configuration: Support loading complex policies from a config file (YAML/TOML).
+    Security Hardening: Input validation, dependency scanning, potential HSM/KMS support for CA key.
+    Observability: Improve metrics and tracing.
+    Documentation: Expand on advanced configuration and usage.
+
+Contributing
+
+Contributions are welcome! Please feel free to open issues or submit pull requests.
