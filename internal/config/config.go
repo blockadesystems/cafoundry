@@ -5,36 +5,54 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 )
 
 type Config struct {
-	DataDir                 string              // Directory to store CA data (keys, certificates, CRLs)
-	Organization            string              // Organization name for the CA certificate
-	Country                 string              // Country code for the CA certificate
-	Province                string              // Province for the CA certificate
-	Locality                string              // Locality for the CA certificate
-	CommonName              string              // Common Name for the CA certificate
-	CACertValidityYears     int                 // Validity period of the CA certificate in years
-	DefaultCertValidityDays int                 // Default validity period for issued certificates in days
-	CRLValidityHours        int                 // Validity period for the CRL in hours
-	StorageType             string              // Storage type: "postgres"
-	DBHost                  string              // PostgreSQL host
-	DBUser                  string              // PostgreSQL user
-	DBPassword              string              // PostgreSQL password
-	DBName                  string              // PostgreSQL database name
-	DBPort                  int                 // PostgreSQL port
-	DBSSLMode               string              // PostgreSQL SSL mode
-	DBCert                  string              // PostgreSQL client certificate file
-	DBKey                   string              // PostgreSQL client private key file
-	DBRootCert              string              // PostgreSQL root CA certificate file
-	Users                   map[string]User     // User credentials and roles (Deprecated)
-	APIKeys                 map[string]APIKey   // API keys and their roles
-	CertificatePolicies     CertificatePolicies // Certificate policies
-	HTTPSCertFile           string              // Path to the HTTPS certificate file
-	HTTPSKeyFile            string              // Path to the HTTPS private key file
-	HTTPSAddress            string              // The address to listen on for HTTPS
-	ExternalURL             string              // The external URL for the CA service
+	DataDir                 string                  // Directory to store CA data (keys, certificates, CRLs)
+	Organization            string                  // Organization name for the CA certificate
+	Country                 string                  // Country code for the CA certificate
+	Province                string                  // Province for the CA certificate
+	Locality                string                  // Locality for the CA certificate
+	CommonName              string                  // Common Name for the CA certificate
+	CACertValidityYears     int                     // Validity period of the CA certificate in years
+	DefaultCertValidityDays int                     // Default validity period for issued certificates in days
+	CRLValidityHours        int                     // Validity period for the CRL in hours
+	StorageType             string                  // Storage type: "postgres"
+	DBHost                  string                  // PostgreSQL host
+	DBUser                  string                  // PostgreSQL user
+	DBPassword              string                  // PostgreSQL password
+	DBName                  string                  // PostgreSQL database name
+	DBPort                  int                     // PostgreSQL port
+	DBSSLMode               string                  // PostgreSQL SSL mode
+	DBCert                  string                  // PostgreSQL client certificate file
+	DBKey                   string                  // PostgreSQL client private key file
+	DBRootCert              string                  // PostgreSQL root CA certificate file
+	Users                   map[string]User         // User credentials and roles (Deprecated)
+	APIKeys                 map[string]APIKey       // API keys and their roles
+	CertificatePolicies     CertificatePolicies     // Certificate policies
+	HTTPSCertFile           string                  // Path to the HTTPS certificate file
+	HTTPSKeyFile            string                  // Path to the HTTPS private key file
+	HTTPSAddress            string                  // The address to listen on for HTTPS
+	HTTPAddress             string                  // The address to listen on for HTTP
+	ExternalURL             string                  // The external URL for the CA service
+	ACMEDirectoryMeta       ACMEDirectoryMetaConfig // New struct for ACME meta fields
+	NonceLifetime           time.Duration           // How long ACME nonces are valid
+	OrderLifetime           time.Duration           // How long ACME orders are valid (e.g., 7 days)
+	AuthorizationLifetime   time.Duration           // How long ACME authorizations are valid (e.g., 30 days)
+	CRLDistributionPoints   []string                // URLs for CRL Distribution Points extension
+	OCSPServer              []string                // URLs for OCSP servers (AIA extension)
+	IssuingCertificateURL   []string                // URLs for CA issuer cert (AIA extension)
 	// Add other configuration options here later
+}
+
+// Add new struct for ACME Directory Meta fields
+type ACMEDirectoryMetaConfig struct {
+	TermsOfServiceURL       string   `json:"termsOfService,omitempty"`
+	WebsiteURL              string   `json:"website,omitempty"`
+	CaaIdentities           []string `json:"caaIdentities,omitempty"`           // Domain names the CA controls
+	ExternalAccountRequired bool     `json:"externalAccountRequired,omitempty"` // Typically false
 }
 
 // User defines a user with credentials and roles. (Deprecated)
@@ -78,7 +96,17 @@ const (
 	defaultHTTPSCertFile       = "./data/https.crt"
 	defaultHTTPSKeyFile        = "./data/https.key"
 	defaultHTTPSAddress        = ":8443"
+	defaultHTTPAddress         = ":8080"
 	defaultExternalURL         = "https://localhost:8443"
+	defaultTermsOfServiceURL   = ""             // Recommend setting via env
+	defaultWebsiteURL          = ""             // Recommend setting via env
+	defaultCaaIdentities       = ""             // Comma-separated list in env var
+	defaultNonceLifetimeSecs   = 3600           // 1 hour in seconds
+	defaultOrderLifetimeSecs   = 7 * 24 * 3600  // 7 days
+	defaultAuthzLifetimeSecs   = 30 * 24 * 3600 // 30 days
+	defaultCRLDPs              = ""             // Comma-separated URLs
+	defaultOCSPUrls            = ""             // Comma-separated URLs
+	defaultIssuerUrls          = ""             // Comma-separated URLs
 )
 
 var defaultAPIKeys = map[string]APIKey{
@@ -99,6 +127,13 @@ var defaultCertificatePolicies = CertificatePolicies{
 
 // LoadConfig loads the CA configuration from environment variables or defaults.
 func LoadConfig() (*Config, error) {
+	nonceLifetime := getEnvAsDurationSec("CAFOUNDRY_NONCE_LIFETIME_SECONDS", defaultNonceLifetimeSecs)
+	orderLifetime := getEnvAsDurationSec("CAFOUNDRY_ORDER_LIFETIME_SECONDS", defaultOrderLifetimeSecs)
+	authzLifetime := getEnvAsDurationSec("CAFOUNDRY_AUTHZ_LIFETIME_SECONDS", defaultAuthzLifetimeSecs)
+	crlDPs := getEnvAsStringSlice("CAFOUNDRY_CRL_DP", defaultCRLDPs)
+	ocspUrls := getEnvAsStringSlice("CAFOUNDRY_OCSP_URL", defaultOCSPUrls)
+	issuerUrls := getEnvAsStringSlice("CAFOUNDRY_ISSUER_URL", defaultIssuerUrls)
+
 	cfg := &Config{
 		DataDir:                 getEnv("CAFOUNDRY_DATA_DIR", defaultDataDir),
 		Organization:            getEnv("CAFOUNDRY_ORGANIZATION", defaultOrganization),
@@ -125,7 +160,20 @@ func LoadConfig() (*Config, error) {
 		HTTPSCertFile:           getEnv("CAFOUNDRY_HTTPS_CERT_FILE", defaultHTTPSCertFile),
 		HTTPSKeyFile:            getEnv("CAFOUNDRY_HTTPS_KEY_FILE", defaultHTTPSKeyFile),
 		HTTPSAddress:            getEnv("CAFOUNDRY_HTTPS_ADDRESS", defaultHTTPSAddress),
-		ExternalURL:             getEnv("CAFOUNDRY_EXTERNAL_URL", defaultExternalURL),
+		HTTPAddress:             getEnv("CAFOUNDRY_HTTP_ADDRESS", defaultHTTPAddress),
+		ExternalURL:             strings.TrimSuffix(getEnv("CAFOUNDRY_EXTERNAL_URL", defaultExternalURL), "/"), // Ensure no trailing slash
+		NonceLifetime:           nonceLifetime,
+		OrderLifetime:           orderLifetime,
+		AuthorizationLifetime:   authzLifetime,
+		ACMEDirectoryMeta: ACMEDirectoryMetaConfig{
+			TermsOfServiceURL:       getEnv("CAFOUNDRY_ACME_TOS_URL", defaultTermsOfServiceURL),
+			WebsiteURL:              getEnv("CAFOUNDRY_ACME_WEBSITE_URL", defaultWebsiteURL),
+			CaaIdentities:           getEnvAsStringSlice("CAFOUNDRY_ACME_CAA_IDENTITIES", defaultCaaIdentities),
+			ExternalAccountRequired: getEnvAsBool("CAFOUNDRY_ACME_EAB_REQUIRED", false), // Default EAB to false
+		},
+		CRLDistributionPoints: crlDPs,
+		OCSPServer:            ocspUrls,
+		IssuingCertificateURL: issuerUrls,
 	}
 	// Add more configuration loading logic here later
 	return cfg, nil
@@ -150,4 +198,53 @@ func getEnvAsInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return value
+}
+
+// New helper for duration in seconds
+func getEnvAsDurationSec(key string, defaultValue int) time.Duration {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return time.Duration(defaultValue) * time.Second
+	}
+	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		log.Printf("Warning: Invalid integer value for %s (%s), using default: %d seconds", key, valueStr, defaultValue)
+		return time.Duration(defaultValue) * time.Second
+	}
+	return time.Duration(value) * time.Second
+}
+
+// New helper for boolean
+func getEnvAsBool(key string, defaultValue bool) bool {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		return defaultValue
+	}
+	value, err := strconv.ParseBool(strings.ToLower(valueStr))
+	if err != nil {
+		log.Printf("Warning: Invalid boolean value for %s (%s), using default: %t", key, valueStr, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+// New helper for comma-separated string slice
+func getEnvAsStringSlice(key string, defaultValue string) []string {
+	valueStr := os.Getenv(key)
+	if valueStr == "" {
+		valueStr = defaultValue
+	}
+	if valueStr == "" { // Handle case where default is also empty
+		return nil
+	}
+	// Trim whitespace around commas and filter empty strings
+	parts := strings.Split(valueStr, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }

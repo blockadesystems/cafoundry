@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
@@ -25,6 +31,32 @@ func init() {
 		panic(err)
 	}
 	logger = l.With(zap.String("package", "main"))
+}
+
+// Helper to apply common middleware
+func applyCommonMiddleware(e *echo.Echo, store storage.Storage, cfg *config.Config, caService ca.CAService) {
+	e.HideBanner = true
+	e.Use(middleware.Recover())
+	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
+		Generator: func() string { return uuid.NewString() },
+	}))
+
+	// Middleware to set context values (logger, store, cfg, caService)
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			reqID := c.Response().Header().Get(echo.HeaderXRequestID)
+			// Use the global 'logger' as the base for the request logger
+			reqLogger := logger.With(zap.String("request_id", reqID))
+
+			c.Set("caService", caService)
+			c.Set("cfg", cfg)
+			c.Set("store", store)
+			c.Set("logger", reqLogger) // Set request-scoped logger
+			return next(c)
+		}
+	})
+	// Add Echo's logger *after* request ID and our logger are set, if desired
+	e.Use(middleware.Logger())
 }
 
 func main() {
@@ -82,51 +114,129 @@ func main() {
 		os.Exit(1)
 	}
 
+	// --- Create Echo Instances ---
+	httpInstance := echo.New()
+	httpsInstance := echo.New()
+	// --- Apply Common Middleware ---
+	// Apply middleware providing context values (store, logger, cfg, caService) to BOTH instances
+	applyCommonMiddleware(httpInstance, store, cfg, caService)
+	applyCommonMiddleware(httpsInstance, store, cfg, caService)
+
+	// --- Define HTTP Routes ---
+	// Root handler (optional on HTTP)
+	httpInstance.GET("/", func(c echo.Context) error {
+		// Optional: Redirect to HTTPS?
+		// return c.Redirect(http.StatusMovedPermanently, "https://"+c.Request().Host+c.Request().RequestURI)
+		return c.String(http.StatusOK, "CA Foundry is running (HTTP)")
+	})
+	// ACME HTTP-01 Challenge Endpoint MUST be on HTTP instance
+	httpInstance.GET("/.well-known/acme-challenge/:token", acme.HandleHTTP01Challenge)
+
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover())
 
-	// Middle to pass caService, cfg, and store to handlers
-	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Set("caService", caService)
-			c.Set("cfg", cfg)
-			c.Set("store", store)
-			return next(c)
+	// Add Request ID middleware
+	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
+		Generator: func() string {
+			return uuid.NewString()
+		},
+	}))
+
+	// --- Define HTTPS Routes ---
+	// Root handler (optional on HTTPS)
+	httpsInstance.GET("/", func(c echo.Context) error {
+		return c.String(http.StatusOK, "CA Foundry is running (HTTPS)")
+	})
+	// ACME protocol endpoints MUST be on HTTPS instance
+	acmeGroup := httpsInstance.Group("/acme")
+	acmeGroup.GET("/directory", acme.HandleDirectory)
+	acmeGroup.HEAD("/new-nonce", acme.HandleNewNonce) // HEAD before GET/POST usually
+	acmeGroup.GET("/new-nonce", acme.HandleNewNonce)  // Also allow GET for nonce
+	acmeGroup.POST("/new-account", acme.HandleNewAccount)
+	acmeGroup.POST("/account/:accountID", acme.HandleAccount)
+	acmeGroup.POST("/new-order", acme.HandleNewOrder)
+	acmeGroup.POST("/order/:orderID", acme.HandleGetOrder)      // POST-as-GET
+	acmeGroup.POST("/authz/:authzID", acme.HandleAuthorization) // POST-as-GET
+	acmeGroup.POST("/chall/:challengeID", acme.HandleChallenge)
+	acmeGroup.POST("/finalize/:orderID", acme.HandleFinalize)
+	acmeGroup.POST("/cert/:certID", acme.HandleCertificate)
+	acmeGroup.POST("/revoke-cert", acme.HandleRevokeCertificate)
+
+	// Start HTTP server and HTTPS server
+	// --- Start Servers in Goroutines ---
+	var wg sync.WaitGroup
+	wg.Add(2) // Expect two servers to start
+
+	go func() {
+		defer wg.Done()
+		logger.Info("Starting HTTP server", zap.String("address", cfg.HTTPAddress))
+		if err := httpInstance.Start(cfg.HTTPAddress); err != nil && err != http.ErrServerClosed {
+			logger.Error("HTTP server failed to start or crashed", zap.Error(err))
+			// Consider signaling main thread to exit instead of os.Exit here
+		} else if err == http.ErrServerClosed {
+			logger.Info("HTTP server shut down gracefully")
 		}
-	})
+	}()
 
-	e.GET("/", func(c echo.Context) error {
-		return c.String(http.StatusOK, "CA Foundry is running!")
-	})
+	go func() {
+		defer wg.Done()
+		logger.Info("Starting HTTPS server", zap.String("address", cfg.HTTPSAddress))
+		if err := httpsInstance.StartTLS(cfg.HTTPSAddress, certFile, keyFile); err != nil && err != http.ErrServerClosed {
+			logger.Error("HTTPS server failed to start or crashed", zap.Error(err))
+			// Consider signaling main thread to exit
+		} else if err == http.ErrServerClosed {
+			logger.Info("HTTPS server shut down gracefully")
+		}
+	}()
 
-	// ACME protocol endpoints
-	acmeGroup := e.Group("/acme")
-	acmeGroup.GET("/directory", acme.HandleDirectory)            // Directory endpoint
-	acmeGroup.GET("/new-nonce", acme.HandleNewNonce)             // Nonce endpoint
-	acmeGroup.HEAD("/new-nonce", acme.HandleNewNonce)            // Nonce endpoint (HEAD method)
-	acmeGroup.POST("/new-account", acme.HandleNewAccount)        // Account creation
-	acmeGroup.POST("/account/:accountID", acme.HandleAccount)    // Account management
-	acmeGroup.POST("/new-order", acme.HandleNewOrder)            // Order creation
-	acmeGroup.GET("/order/:orderID", acme.HandleGetOrder)        // Order status/management
-	acmeGroup.POST("/authz/:authzID", acme.HandleAuthorization)  // Authorization objects
-	acmeGroup.POST("/chall/:challengeID", acme.HandleChallenge)  // Challenge objects
-	acmeGroup.POST("/finalize/:orderID", acme.HandleFinalize)    // Order finalization
-	acmeGroup.GET("/cert/:certID", acme.HandleCertificate)       // Certificate download
-	acmeGroup.POST("/revoke-cert", acme.HandleRevokeCertificate) // Certificate revocation
+	// --- Graceful Shutdown Handling ---
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	<-quit // Wait for interrupt signal
 
-	// CA Foundry specific endpoints
-	// apiGroup := e.Group("/api")
-	// apiGroup.GET("/health", s.handleHealth)		// Health/status endpoint
-	// apiGroup.GET("/ca-chain", s.handleCAChain)	// CA certificate chain endpoint
-	// apiGroup.POST("/ocsp", s.handleOCSP)		// OCSP endpoint
-	// apiGroup.GET("/crl", s.handleCRL)			// CRL distribution endpoint
+	logger.Info("Shutting down servers...")
 
-	address := cfg.HTTPSAddress
-	logger.Info("listening on address", zap.String("address", address))
-	err = e.StartTLS(address, certFile, keyFile)
-	if err != nil {
-		logger.Fatal("error starting HTTPS server", zap.Error(err), zap.String("address", address))
+	// Create context with timeout for shutdown
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 10-second timeout
+	defer cancel()
+
+	// Shutdown servers
+	shutdownErr := false
+	if err := httpInstance.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTP server shutdown failed", zap.Error(err))
+		shutdownErr = true
+	}
+	if err := httpsInstance.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTPS server shutdown failed", zap.Error(err))
+		shutdownErr = true
+	}
+
+	// Close storage connection pool
+	if err := store.Close(); err != nil {
+		logger.Error("Storage connection closing failed", zap.Error(err))
+		shutdownErr = true
+	}
+
+	// Wait for server goroutines to finish (they should finish after Shutdown)
+	// Add a timeout channel to prevent hanging indefinitely if wg.Done() isn't called
+	waitChan := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitChan)
+	}()
+
+	select {
+	case <-waitChan:
+		logger.Info("All server goroutines finished.")
+	case <-time.After(12 * time.Second): // Slightly longer than shutdown timeout
+		logger.Warn("Timed out waiting for server goroutines to finish.")
+		shutdownErr = true
+	}
+
+	if shutdownErr {
+		logger.Warn("Shutdown completed with errors.")
 		os.Exit(1)
 	}
+	logger.Info("Server shutdown completed successfully.")
 }

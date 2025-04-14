@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-
-	"github.com/blockadesystems/cafoundry/internal/config"
 )
 
 // var logger *zap.Logger
@@ -26,26 +24,26 @@ func init() {
 // EnsureHTTPSCertificates checks if the HTTPS certificate and key files exist.
 // If they don't, it generates a self-signed certificate and saves them to the configured paths.
 // It returns the paths to the certificate and key files.
-func EnsureHTTPSCertificates(cfg *config.Config) (certFile string, keyFile string, err error) {
-	if _, err := os.Stat(cfg.HTTPSCertFile); os.IsNotExist(err) {
-		if _, err := os.Stat(cfg.HTTPSKeyFile); os.IsNotExist(err) {
-			// Generate self-signed certificate
-			err = generateSelfSignedCert(cfg.HTTPSCertFile, cfg.HTTPSKeyFile, cfg.CommonName)
-			if err != nil {
-				return "", "", fmt.Errorf("ca: failed to generate self-signed certificate: %w", err)
-			}
-			logger.Info("generated self-signed HTTPS certificate", zap.String("cert_file", cfg.HTTPSCertFile), zap.String("key_file", cfg.HTTPSKeyFile))
-		} else {
-			return "", "", fmt.Errorf("ca: key file exists but cert file does not")
-		}
-	} else if _, err := os.Stat(cfg.HTTPSKeyFile); os.IsNotExist(err) {
-		return "", "", fmt.Errorf("ca: cert file exists but key file does not")
-	} else {
-		logger.Info("found existing HTTPS certificate and key", zap.String("cert_file", cfg.HTTPSCertFile), zap.String("key_file", cfg.HTTPSKeyFile))
-	}
+// func EnsureHTTPSCertificates(cfg *config.Config) (certFile string, keyFile string, err error) {
+// 	if _, err := os.Stat(cfg.HTTPSCertFile); os.IsNotExist(err) {
+// 		if _, err := os.Stat(cfg.HTTPSKeyFile); os.IsNotExist(err) {
+// 			// Generate self-signed certificate
+// 			err = generateSelfSignedCert(cfg.HTTPSCertFile, cfg.HTTPSKeyFile, cfg.CommonName)
+// 			if err != nil {
+// 				return "", "", fmt.Errorf("ca: failed to generate self-signed certificate: %w", err)
+// 			}
+// 			logger.Info("generated self-signed HTTPS certificate", zap.String("cert_file", cfg.HTTPSCertFile), zap.String("key_file", cfg.HTTPSKeyFile))
+// 		} else {
+// 			return "", "", fmt.Errorf("ca: key file exists but cert file does not")
+// 		}
+// 	} else if _, err := os.Stat(cfg.HTTPSKeyFile); os.IsNotExist(err) {
+// 		return "", "", fmt.Errorf("ca: cert file exists but key file does not")
+// 	} else {
+// 		logger.Info("found existing HTTPS certificate and key", zap.String("cert_file", cfg.HTTPSCertFile), zap.String("key_file", cfg.HTTPSKeyFile))
+// 	}
 
-	return cfg.HTTPSCertFile, cfg.HTTPSKeyFile, nil
-}
+// 	return cfg.HTTPSCertFile, cfg.HTTPSKeyFile, nil
+// }
 
 // generateSelfSignedCert generates a self-signed certificate for HTTPS.
 func generateSelfSignedCert(certFile string, keyFile string, commonName string) error {
