@@ -44,6 +44,7 @@ type Config struct {
 	CRLDistributionPoints   []string                // URLs for CRL Distribution Points extension
 	OCSPServer              []string                // URLs for OCSP servers (AIA extension)
 	IssuingCertificateURL   []string                // URLs for CA issuer cert (AIA extension)
+	DNSResolver             string                  // Address (ip:port) for DNS resolver used for validation
 	// Add other configuration options here later
 }
 
@@ -107,6 +108,7 @@ const (
 	defaultCRLDPs              = ""             // Comma-separated URLs
 	defaultOCSPUrls            = ""             // Comma-separated URLs
 	defaultIssuerUrls          = ""             // Comma-separated URLs
+	defaultDNSResolver         = ""             // "ip:port" for DNS resolver used for validation (127.0.0.1:8053, etc.)
 )
 
 var defaultAPIKeys = map[string]APIKey{
@@ -174,6 +176,7 @@ func LoadConfig() (*Config, error) {
 		CRLDistributionPoints: crlDPs,
 		OCSPServer:            ocspUrls,
 		IssuingCertificateURL: issuerUrls,
+		DNSResolver:           getEnv("CAFOUNDRY_DNS_RESOLVER", defaultDNSResolver),
 	}
 	// Add more configuration loading logic here later
 	return cfg, nil

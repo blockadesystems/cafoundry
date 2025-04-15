@@ -898,7 +898,25 @@ func saveAccount(ctx context.Context, q Querier, acc *model.Account) error {
         ON CONFLICT (id) DO UPDATE SET
             public_key_jwk = EXCLUDED.public_key_jwk, contact = EXCLUDED.contact, status = EXCLUDED.status,
             tos_agreed = EXCLUDED.tos_agreed, eab = EXCLUDED.eab, last_modified_at = EXCLUDED.last_modified_at`
-	_, err := q.ExecContext(ctx, query, acc.ID, acc.PublicKeyJWK, pq.Array(acc.Contact), acc.Status, acc.TermsOfService, acc.ExternalAccountBinding, acc.CreatedAt, acc.LastModifiedAt)
+	var eabArg interface{}                    // Use interface{} to allow passing nil for NULL
+	if len(acc.ExternalAccountBinding) == 0 { // Check if nil or empty []byte
+		eabArg = nil // Pass nil to let the driver handle SQL NULL
+	} else {
+		// Ensure the bytes are valid JSON before sending? Or rely on DB validation?
+		// Let's pass the bytes directly, DB will validate JSONB syntax.
+		eabArg = acc.ExternalAccountBinding
+	}
+	_, err := q.ExecContext(ctx, query,
+		acc.ID,
+		acc.PublicKeyJWK,
+		pq.Array(acc.Contact),
+		acc.Status,
+		acc.TermsOfService,
+		eabArg, // <-- Use the potentially nil argument here
+		acc.CreatedAt,
+		acc.LastModifiedAt,
+	)
+
 	if err != nil {
 		return fmt.Errorf("storage: failed to save account '%s': %w", acc.ID, err)
 	}

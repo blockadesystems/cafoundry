@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	jose "github.com/go-jose/go-jose/v3" // Use v4
+	jose "github.com/go-jose/go-jose/v4"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
@@ -36,6 +36,13 @@ import (
 )
 
 var logger *zap.Logger
+
+// Define the signature algorithms your server accepts
+var allowedSignatureAlgorithms = []jose.SignatureAlgorithm{
+	jose.ES256, // ECDSA using P-256 and SHA-256 (Recommended)
+	jose.RS256, // RSASSA-PKCS1-v1_5 using SHA-256
+	// Add other algorithms like ES384, PS256 etc. if you intend to support them
+}
 
 // --- Structs ---
 
@@ -193,7 +200,7 @@ func verifyJWSRequest(c echo.Context) (*jwsVerifyResult, error) {
 	ctx := c.Request().Context()
 
 	if c.Request().Header.Get("Content-Type") != contentTypeJOSEJSON {
-		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Incorrect Content-Type, expected application/jose+json")
+		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Incorrect Content-Type")
 	}
 
 	bodyBytes, err := io.ReadAll(c.Request().Body)
@@ -201,76 +208,64 @@ func verifyJWSRequest(c echo.Context) (*jwsVerifyResult, error) {
 		logger.Error("Failed to read request body", zap.Error(err))
 		return nil, acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Failed to read request")
 	}
-	c.Request().Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Rewind body
+	c.Request().Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Rewind
 
-	// Use ParseSigned for v4
-	jws, err := jose.ParseSigned(string(bodyBytes))
+	// Call ParseSigned with allowed algorithms. It handles the algorithm check internally.
+	jws, err := jose.ParseSigned(string(bodyBytes), allowedSignatureAlgorithms)
 	if err != nil {
-		logger.Warn("Failed to parse JWS", zap.Error(err))
+		logger.Warn("Failed to parse JWS (or unsupported algorithm)", zap.Error(err))
+		// Note: err might indicate unsupported algorithm here. Map to badSignatureAlgorithm?
+		// Checking error type/string might be needed for specific ACME error.
+		// Example: if strings.Contains(err.Error(), "algorithm not supported") { return nil, acmeError(...) }
 		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Failed to parse JWS: "+err.Error())
 	}
-
 	if len(jws.Signatures) != 1 {
 		logger.Warn("Expected exactly one signature in JWS", zap.Int("signature_count", len(jws.Signatures)))
-		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid JWS structure (expected single signature)")
+		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid JWS structure")
 	}
 	signature := jws.Signatures[0]
-	protected := signature.Protected
+	protected := signature.Protected // This is jose.Header
 
 	// --- Header Verification ---
-	// Verify Algorithm
-	alg := jose.SignatureAlgorithm(protected.Algorithm)
-	if alg == "" {
-		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Missing or invalid JWS algorithm ('alg')")
-	}
+	// Log algorithm (already validated by ParseSigned)
+	alg := protected.Algorithm
 	logger.Debug("JWS Algorithm", zap.String("alg", string(alg)))
-	// TODO: Check alg against allowlist
 
 	// Verify Nonce
 	nonce := protected.Nonce
 	if nonce == "" {
-		return nil, acmeError(c, http.StatusBadRequest, errTypeBadNonce, "Missing Replay-Nonce in JWS header")
+		return nil, acmeError(c, http.StatusBadRequest, errTypeBadNonce, "Missing Replay-Nonce")
 	}
-	// Corrected Nonce Consumption Check:
 	consumedNonceDetails, err := store.ConsumeNonce(ctx, nonce)
 	if err != nil {
-		logger.Error("Nonce consumption storage error", zap.String("nonce", nonce), zap.Error(err))
 		return nil, acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Nonce validation error")
 	}
 	if consumedNonceDetails == nil {
-		logger.Warn("Invalid, used, or expired nonce received", zap.String("nonce", nonce))
-		return nil, acmeError(c, http.StatusBadRequest, errTypeBadNonce, "Invalid Replay-Nonce: "+nonce)
+		return nil, acmeError(c, http.StatusBadRequest, errTypeBadNonce, "Invalid Replay-Nonce")
 	}
 	logger.Debug("Nonce verified and consumed", zap.String("nonce", nonce))
 
 	// Verify URL
-	// Use RequestURI() to better handle proxies potentially altering Host or Path? Check Echo docs.
-	// For now, reconstruct based on available parts.
 	reqURL := c.Request().URL
-	// Scheme might not be set correctly behind proxy, rely on config/headers? Assume https for now if not set.
 	scheme := c.Scheme()
 	if scheme == "" {
 		scheme = "https"
-	} // Default assumption
+	}
 	reqURLStr := fmt.Sprintf("%s://%s%s", scheme, c.Request().Host, reqURL.Path)
-
-	// Check for URL in unprotected header first (less common but allowed by spec?)
 	var jwsURL string
 	if urlVal, ok := signature.Header.ExtraHeaders["url"].(string); ok {
 		jwsURL = urlVal
 	}
-	// If not in unprotected, check protected (most common)
 	if jwsURL == "" {
 		if urlVal, ok := protected.ExtraHeaders["url"].(string); ok {
 			jwsURL = urlVal
 		}
 	}
 	if jwsURL == "" {
-		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Missing URL in JWS header")
+		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Missing URL")
 	}
 	if subtle.ConstantTimeCompare([]byte(jwsURL), []byte(reqURLStr)) != 1 {
-		logger.Warn("JWS URL mismatch", zap.String("jwsURL", jwsURL), zap.String("reqURL", reqURLStr))
-		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "JWS URL does not match request URL")
+		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "JWS URL mismatch")
 	}
 	logger.Debug("JWS URL verified", zap.String("url", jwsURL))
 
@@ -280,8 +275,10 @@ func verifyJWSRequest(c echo.Context) (*jwsVerifyResult, error) {
 	result.Nonce = nonce
 	result.ProtectedHeader = protected
 
-	jwkHeaderJSON, hasJwk := protected.ExtraHeaders["jwk"].(map[string]interface{})
-	kidHeader, hasKid := protected.ExtraHeaders["kid"].(string)
+	jwkHeaderKey := protected.JSONWebKey
+	kidHeader := protected.KeyID
+	hasJwk := (jwkHeaderKey != nil)
+	hasKid := (kidHeader != "")
 
 	if hasJwk && hasKid {
 		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Request must not have both 'jwk' and 'kid' header")
@@ -289,17 +286,10 @@ func verifyJWSRequest(c echo.Context) (*jwsVerifyResult, error) {
 
 	if hasJwk {
 		logger.Debug("Verifying JWS using 'jwk' header")
-		jwkBytes, _ := json.Marshal(jwkHeaderJSON)
-		jwk := &jose.JSONWebKey{}
-		if err := json.Unmarshal(jwkBytes, jwk); err != nil {
-			logger.Warn("Failed to unmarshal JWK from header", zap.Error(err))
-			return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid 'jwk' header")
-		}
-		// TODO: Check public key policy
-
+		jwk := jwkHeaderKey
+		// TODO: Check public key policy against jwk.Key
 		payload, err = jws.Verify(jwk)
 		if err != nil {
-			logger.Warn("JWS verification failed using 'jwk' header", zap.Error(err))
 			return nil, acmeError(c, http.StatusUnauthorized, errTypeUnauthorized, "JWS verification error: "+err.Error())
 		}
 		result.Payload = payload
@@ -309,40 +299,36 @@ func verifyJWSRequest(c echo.Context) (*jwsVerifyResult, error) {
 		logger.Debug("Verifying JWS using 'kid' header", zap.String("kid", kidHeader))
 		accountURLPrefix := cfg.ExternalURL + "/acme/account/"
 		if !strings.HasPrefix(kidHeader, accountURLPrefix) {
-			logger.Warn("Invalid 'kid' format", zap.String("kid", kidHeader))
 			return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid 'kid' format")
 		}
 		accountID := strings.TrimPrefix(kidHeader, accountURLPrefix)
 
 		account, err := store.GetAccount(ctx, accountID)
 		if err != nil {
-			logger.Error("Failed to retrieve account from storage via kid", zap.String("accountID", accountID), zap.Error(err))
 			return nil, acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Account lookup error")
 		}
 		if account == nil {
-			logger.Warn("Account specified in 'kid' not found", zap.String("accountID", accountID))
 			return nil, acmeError(c, http.StatusUnauthorized, errTypeUnauthorized, "Account not found")
 		}
 		if account.Status != "valid" {
-			logger.Warn("Account specified in 'kid' is not valid", zap.String("accountID", accountID), zap.String("status", account.Status))
-			return nil, acmeError(c, http.StatusUnauthorized, errTypeUnauthorized, "Account is not valid: "+account.Status)
+			return nil, acmeError(c, http.StatusUnauthorized, errTypeUnauthorized, "Account invalid")
 		}
 
-		jwk := &jose.JSONWebKey{}
-		if err := json.Unmarshal([]byte(account.PublicKeyJWK), jwk); err != nil {
+		accountJWK := &jose.JSONWebKey{}
+		if err := json.Unmarshal([]byte(account.PublicKeyJWK), accountJWK); err != nil {
 			logger.Error("Failed to unmarshal stored JWK for account", zap.String("accountID", accountID), zap.Error(err))
 			return nil, acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Failed to process account key")
 		}
 
-		payload, err = jws.Verify(jwk)
+		payload, err = jws.Verify(accountJWK)
 		if err != nil {
-			logger.Warn("JWS verification failed using 'kid' account key", zap.String("accountID", accountID), zap.Error(err))
 			return nil, acmeError(c, http.StatusUnauthorized, errTypeUnauthorized, "JWS verification error: "+err.Error())
 		}
 		result.Payload = payload
 		result.Account = account
 
 	} else {
+		// Neither jwk nor kid present
 		return nil, acmeError(c, http.StatusBadRequest, errTypeMalformed, "Request must have either 'jwk' or 'kid' header")
 	}
 
@@ -438,6 +424,13 @@ func HandleNewAccount(c echo.Context) error {
 	if err != nil {
 		return nil
 	} // Error response already sent
+	if jwsResult == nil {
+		// This means verifyJWSRequest likely called acmeError, sent the response,
+		// and indicated failure by returning a nil result pointer, even though err is nil.
+		logger.Info("Stopping handler because verifyJWSRequest indicated failure without explicit error")
+		// Response was already sent by acmeError called within verifyJWSRequest
+		return nil // Stop processing
+	}
 	if jwsResult.Jwk == nil {
 		logger.Error("Internal error: JWS verification for new-account did not return JWK")
 		return acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Key processing error")
@@ -1026,8 +1019,10 @@ func HandleChallenge(c echo.Context) error {
 		return acmeError(c, http.StatusInternalServerError, errTypeServerInternal, "Database error updating challenge")
 	}
 
+	reqLogger := c.Get("logger").(*zap.Logger) // Get request-scoped logger
+
 	// Trigger validation asynchronously
-	go performValidation(cfg, store, account, authz, chal)
+	go performValidation(cfg, store, account, authz, chal, reqLogger)
 
 	// Generate response nonce FIRST (before returning response)
 	respNonceValue, _ := generateNonceValue() // Error handled below
@@ -1043,18 +1038,21 @@ func HandleChallenge(c echo.Context) error {
 		}
 	}
 
-	chal.URL = fmt.Sprintf("%s/acme/chall/%s", cfg.ExternalURL, chal.ID) // Populate URL for response
-	return c.JSON(http.StatusOK, chal)                                   // Respond with challenge in "processing" state
+	chal.URL = fmt.Sprintf("%s/acme/chall/%s", cfg.ExternalURL, chal.ID)   // Populate URL for response
+	authzURL := fmt.Sprintf("%s/acme/authz/%s", cfg.ExternalURL, authz.ID) // authz object is available from earlier fetch
+	c.Response().Header().Set("Link", fmt.Sprintf("<%s>;rel=\"up\"", authzURL))
+	return c.JSON(http.StatusOK, chal) // Respond with challenge in "processing" state
 }
 
 // performValidation runs the actual challenge check asynchronously.
-func performValidation(cfg *config.Config, store storage.Storage, account *model.Account, authz *model.Authorization, chal *model.Challenge) {
+func performValidation(cfg *config.Config, store storage.Storage, account *model.Account, authz *model.Authorization, chal *model.Challenge, logParam *zap.Logger) {
 	// Use a background context for the async task
 	// Add deadline slightly shorter than overall timeout?
 	valCtx, cancel := context.WithTimeout(context.Background(), 55*time.Second) // e.g., 55 sec timeout for validation check
 	defer cancel()
 
-	bgLogger := logger.With( // Use base package logger for background task
+	bgLogger := logParam.With( // <-- Use the function parameter 'logParam'
+		// zap.String("request_id", ???), // Can't easily get Req ID here
 		zap.String("accountID", account.ID),
 		zap.String("authzID", authz.ID),
 		zap.String("challengeID", chal.ID),
@@ -1085,7 +1083,7 @@ func performValidation(cfg *config.Config, store storage.Storage, account *model
 			case "dns-01":
 				// Ensure domain for DNS check doesn't have wildcard prefix if present
 				domainForDNS := strings.TrimPrefix(authz.Identifier.Value, "*.")
-				isValid, validationErr = validateDNS01(valCtx, bgLogger, domainForDNS, keyAuthz)
+				isValid, validationErr = validateDNS01(valCtx, cfg, bgLogger, domainForDNS, keyAuthz)
 			default:
 				validationErr = fmt.Errorf("unsupported challenge type: %s", chal.Type)
 			}
@@ -1213,15 +1211,27 @@ func validateHTTP01(ctx context.Context, log *zap.Logger, domain string, token s
 }
 
 // validateDNS01 performs the check for a dns-01 challenge.
-func validateDNS01(ctx context.Context, log *zap.Logger, domain string, expectedKeyAuthz string) (bool, error) {
+func validateDNS01(ctx context.Context, cfg *config.Config, log *zap.Logger, domain string, expectedKeyAuthz string) (bool, error) {
 	// Construct FQDN for TXT record: _acme-challenge.<domain>.
 	// Ensure domain is absolute by potentially adding a dot if missing (LookupTXT might handle this)
 	fqdn := fmt.Sprintf("_acme-challenge.%s", domain)
 	log.Info("Performing DNS-01 validation", zap.String("fqdn", fqdn))
 
-	// Using Go's default resolver. Consider allowing configuration of specific resolvers.
+	// Using Go's default resolver unless DNSResolver is configured.
 	// Add timeout via context deadline if not already present.
 	resolver := net.DefaultResolver
+	resolverAddr := cfg.DNSResolver
+	if resolverAddr != "" {
+		resolver = &net.Resolver{
+			PreferGo: true, // Use Go's built-in resolver
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				// Force dialing to the specific resolver address
+				d := net.Dialer{Timeout: 5 * time.Second} // Add timeout
+				return d.DialContext(ctx, network, resolverAddr)
+			},
+		}
+	}
+
 	txtRecords, err := resolver.LookupTXT(ctx, fqdn)
 
 	if err != nil {
@@ -1262,67 +1272,69 @@ func validateDNS01(ctx context.Context, log *zap.Logger, domain string, expected
 // updateAuthzStatus checks if an authorization is complete after a challenge succeeds
 // and updates the parent order if all authzs are valid.
 func updateAuthzStatus(ctx context.Context, log *zap.Logger, store storage.Storage, authzID string) {
-	// Use new background contexts for these updates
-	updateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	updateCtx, cancel := context.WithTimeout(ctx, 30*time.Second) // Use background ctx passed in
 	defer cancel()
 
-	log.Info("Challenge valid, checking parent authorization status")
+	log.Info("Checking parent authorization status after challenge update")
 
 	authz, err := store.GetAuthorization(updateCtx, authzID)
 	if err != nil || authz == nil {
 		log.Error("Failed to refetch authorization after challenge validation", zap.Error(err))
 		return
 	}
-	// Avoid re-processing if status somehow changed
-	if authz.Status != "pending" {
-		log.Warn("Parent authorization status changed unexpectedly", zap.String("status", authz.Status))
-		return
+	// Check if authz is already in a final state
+	if authz.Status == "valid" || authz.Status == "invalid" || authz.Status == "revoked" || authz.Status == "expired" {
+		log.Debug("Parent authorization already in final state", zap.String("status", authz.Status))
+		return // Already finalized, no need to check challenges
 	}
 
-	// Get all challenges for this authorization
 	challenges, err := store.GetChallengesByAuthorizationID(updateCtx, authzID)
 	if err != nil {
 		log.Error("Failed to fetch challenges to update authorization status", zap.Error(err))
 		return
 	}
 
-	// Check if any challenge is still pending or processing
-	allValid := true
-	hasAValidChallenge := false // Need at least one challenge to be valid
+	// Check if *any* challenge is now valid. If so, the authorization becomes valid.
+	var oneChallengeIsValid bool = false
 	for _, ch := range challenges {
-		if ch.Status == "pending" || ch.Status == "processing" {
-			allValid = false
-			break // No need to check further
-		}
 		if ch.Status == "valid" {
-			hasAValidChallenge = true
+			oneChallengeIsValid = true
+			break // Found a valid challenge, no need to check others
 		}
-		// If any challenge is invalid, the authz becomes invalid (unless another is valid?)
-		// Let's assume: if *any* challenge becomes valid, authz becomes valid.
-		// If all challenges finalize and none are valid, authz becomes invalid.
 	}
 
-	if hasAValidChallenge { // If at least one challenge is valid, mark authz valid
-		log.Info("Authorization fulfilled, updating status to valid")
-		authz.Status = "valid"
+	newAuthzStatus := ""
+	if oneChallengeIsValid {
+		newAuthzStatus = "valid"
+	} else {
+		// If no challenge is valid yet, check if *all* challenges are finalized (invalid)
+		allChallengesFinalized := true
+		for _, ch := range challenges {
+			if ch.Status == "pending" || ch.Status == "processing" {
+				allChallengesFinalized = false
+				break
+			}
+		}
+		if allChallengesFinalized { // All challenges are done, but none were valid
+			newAuthzStatus = "invalid"
+		}
+	}
+
+	// If status needs changing, save it and potentially update order
+	if newAuthzStatus != "" && newAuthzStatus != authz.Status {
+		log.Info("Authorization status changing", zap.String("oldStatus", authz.Status), zap.String("newStatus", newAuthzStatus))
+		authz.Status = newAuthzStatus
 		if err := store.SaveAuthorization(updateCtx, authz); err != nil {
-			log.Error("Failed to save authorization status as valid", zap.Error(err))
+			log.Error("Failed to save authorization status", zap.String("status", newAuthzStatus), zap.Error(err))
 			return // Stop processing if save fails
 		}
-		// Authorization is valid, now check the order
-		updateOrderStatus(context.Background(), log, store, authz.OrderID)
 
-	} else if allValid && !hasAValidChallenge { // All challenges done, but none are valid
-		log.Warn("Authorization failed, all challenges finalized but none valid")
-		authz.Status = "invalid"
-		if err := store.SaveAuthorization(updateCtx, authz); err != nil {
-			log.Error("Failed to save authorization status as invalid", zap.Error(err))
+		// If the authorization just became valid OR invalid, check the order status
+		if newAuthzStatus == "valid" || newAuthzStatus == "invalid" {
+			updateOrderStatus(context.Background(), log, store, authz.OrderID)
 		}
-		// Also potentially mark order as invalid?
-		updateOrderStatus(context.Background(), log, store, authz.OrderID)
 	} else {
-		// Still pending/processing challenges
-		log.Debug("Authorization still has pending/processing challenges")
+		log.Debug("Authorization status remains", zap.String("status", authz.Status))
 	}
 }
 
@@ -1611,15 +1623,25 @@ func HandleFinalize(c echo.Context) error {
 	// 8. Store Issued Certificate
 	// TODO: Get issuer chain from caSvc if needed? Assume chain is handled separately or appended by client.
 	certPEM := ca.EncodeCertificate(signedCert) // Use helper from ca package? Assume it exists.
+	issuerCert := caSvc.GetCACertificate()      // Get the CA cert object from the service
+	var issuerCertPEM []byte
+	if issuerCert != nil {
+		issuerCertPEM = ca.EncodeCertificate(issuerCert)
+	} else {
+		// Should not happen if CA is initialized, but handle defensively
+		logger.Error("Could not retrieve CA certificate to build chain")
+		// Decide how to handle this - fail finalize? proceed without chain?
+		// Let's proceed without chain but log error. Client might complain later.
+	}
 	certData := &model.CertificateData{
 		SerialNumber:   signedCert.SerialNumber.Text(16), // Store hex serial
 		CertificatePEM: string(certPEM),
-		// ChainPEM:      string(issuerChainPEM), // Add if applicable
-		IssuedAt:  signedCert.NotBefore, // Use actual cert times
-		ExpiresAt: signedCert.NotAfter,
-		AccountID: account.ID,
-		OrderID:   orderID,
-		Revoked:   false,
+		ChainPEM:       string(issuerCertPEM),
+		IssuedAt:       signedCert.NotBefore, // Use actual cert times
+		ExpiresAt:      signedCert.NotAfter,
+		AccountID:      account.ID,
+		OrderID:        orderID,
+		Revoked:        false,
 	}
 	if err := store.SaveCertificateData(ctx, certData); err != nil {
 		logger.Error("Failed to save issued certificate data", zap.String("serial", certData.SerialNumber), zap.Error(err))
@@ -1788,7 +1810,7 @@ func HandleRevokeCertificate(c echo.Context) error {
 	}
 	c.Request().Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Rewind
 
-	jws, err := jose.ParseSigned(string(bodyBytes))
+	jws, err := jose.ParseSigned(string(bodyBytes), allowedSignatureAlgorithms)
 	if err != nil {
 		return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Failed to parse JWS: "+err.Error())
 	}
