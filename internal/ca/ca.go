@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -218,36 +219,66 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 	}
 	l.Debug("CSR signature validated")
 
-	// 2. Validate Public Key (Policy)
-	// TODO: Implement stricter policy checks based on cfg.CertificatePolicies
+	// 2. Validate Public Key (Policy) - Placeholder remains
+	// TODO: Implement stricter policy checks based on cfg.CertificatePolicies (allowed types/curves/sizes)
 	switch pub := csr.PublicKey.(type) {
 	case *rsa.PublicKey:
 		keySize := pub.N.BitLen()
 		l.Debug("CSR contains RSA key", zap.Int("size", keySize))
-		// Example check: if keySize < 2048 { return nil, errors.New("RSA key size too small") }
 	case *ecdsa.PublicKey:
 		curveName := pub.Curve.Params().Name
 		l.Debug("CSR contains ECDSA key", zap.String("curve", curveName))
-		// Example check: if curveName != "P-256" && curveName != "P-384" { return nil, errors.New("unsupported ECDSA curve") }
 	case ed25519.PublicKey:
 		l.Debug("CSR contains Ed25519 key")
-		// Generally accepted
 	default:
 		l.Warn("CSR contains unsupported public key type")
 		return nil, errors.New("unsupported public key type in CSR")
 	}
 
-	// 3. Validate Subject/SANs (Policy)
-	// TODO: Implement domain allow-list/block-list checks based on cfg
-	// TODO: Implement CAA checking (requires DNS lookups)
-	l.Debug("CSR Subject/SAN validation placeholder")
-	if len(csr.DNSNames) == 0 && len(csr.IPAddresses) == 0 && len(csr.EmailAddresses) == 0 && len(csr.URIs) == 0 {
-		l.Warn("CSR contains no Subject Alternative Names (SANs)")
-		return nil, errors.New("CSR must contain at least one SAN (DNSName, IPAddress, EmailAddress, or URI)")
+	// 3. Validate Subject/SANs against DB Policy
+	l.Debug("Validating CSR Subject/SANs against stored policy")
+	hasSANs := false
+	// Check DNS Names
+	for _, dnsName := range csr.DNSNames {
+		hasSANs = true
+		normName := strings.ToLower(strings.TrimSpace(dnsName)) // Normalize before checking
+		allowed, err := s.store.IsDomainAllowed(ctx, normName)
+		if err != nil {
+			l.Error("Failed to check domain policy for DNS name", zap.String("dnsName", normName), zap.Error(err))
+			return nil, fmt.Errorf("policy check failed for %s", normName) // Internal error
+		}
+		if !allowed { //
+			l.Warn("CSR contains disallowed DNS name", zap.String("dnsName", normName))
+			// Return specific error CA Foundry can map to ACME error
+			return nil, fmt.Errorf("domain name %s is not allowed by CA policy", normName)
+		}
 	}
+	// Check IP Addresses (Basic exact match check against domain policy table)
+	for _, ipAddr := range csr.IPAddresses {
+		hasSANs = true
+		ipStr := ipAddr.String()
+		// NOTE: This checks if the *literal IP string* is in the allowed *domains* table.
+		// A more robust implementation would have separate IP/CIDR policies.
+		allowed, err := s.store.IsDomainAllowed(ctx, ipStr)
+		if err != nil {
+			l.Error("Failed to check domain policy for IP address", zap.String("ip", ipStr), zap.Error(err))
+			return nil, fmt.Errorf("policy check failed for %s", ipStr) // Internal error
+		}
+		if !allowed { //
+			l.Warn("CSR contains disallowed IP address", zap.String("ip", ipStr))
+			return nil, fmt.Errorf("IP address %s is not allowed by CA policy", ipStr)
+		}
+	}
+	// TODO: Add checks for EmailAddresses / URIs if policy dictates
+
+	if !hasSANs { //
+		l.Warn("CSR contains no Subject Alternative Names (DNSNames or IPAddresses checked)")
+		return nil, errors.New("CSR must contain at least one DNSName or IPAddress SAN allowed by policy")
+	}
+	l.Info("CSR Subject/SAN validation passed against stored policy") //
+	// TODO: Implement CAA checking
 
 	// 4. Validate & Calculate Lifetime (Policy)
-	// Use default from config for now, potentially clamp based on order.NotAfter if provided earlier
 	maxLifetime := time.Duration(s.cfg.DefaultCertValidityDays) * 24 * time.Hour
 	if lifetime <= 0 || lifetime > maxLifetime {
 		l.Warn("Requested lifetime out of bounds or zero, using default/max", zap.Duration("requested", lifetime), zap.Duration("max", maxLifetime))
@@ -255,12 +286,9 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 	}
 	notBefore := time.Now().Add(-2 * time.Minute) // Allow for clock skew
 	notAfter := notBefore.Add(lifetime)
-
-	// Ensure calculated NotAfter doesn't exceed CA's NotAfter
 	if notAfter.After(s.caCert.NotAfter) {
 		l.Warn("Requested/calculated lifetime exceeds CA certificate validity, adjusting", zap.Time("original_notAfter", notAfter), zap.Time("ca_notAfter", s.caCert.NotAfter))
 		notAfter = s.caCert.NotAfter
-		// Adjust NotBefore slightly relative to new NotAfter if needed? Maybe not necessary.
 	}
 	l.Info("Calculated certificate validity", zap.Time("notBefore", notBefore), zap.Time("notAfter", notAfter))
 
@@ -269,28 +297,27 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate serial number: %w", err)
 	}
-
-	// Generate Subject Key Identifier (SKI) from the public key in the CSR
 	ski, err := computeSubjectKeyID(csr.PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute subject key identifier: %w", err)
 	}
 
-	// Basic Subject - ACME relies on SANs, CommonName is often deprecated/ignored
-	// Let's set CN to the first DNS name if available.
 	subject := pkix.Name{Organization: []string{s.cfg.Organization}} // Use Org from CA config
 	if len(csr.DNSNames) > 0 {
 		subject.CommonName = csr.DNSNames[0]
 	} else if len(csr.EmailAddresses) > 0 {
-		// Could use email if no DNS? Or leave CN empty.
 		subject.CommonName = csr.EmailAddresses[0]
 	}
-	// Alternatively, copy subject fields directly from CSR if desired/allowed by policy:
-	// subject = csr.Subject
+
+	// Combine Allowed Key Usages from config policy
+	var combinedKeyUsage x509.KeyUsage = 0
+	for _, ku := range s.cfg.CertificatePolicies.AllowedKeyUsages {
+		combinedKeyUsage |= ku //
+	}
 
 	template := x509.Certificate{
 		SerialNumber:   serialNumber,
-		Subject:        subject, // Use minimal subject derived above
+		Subject:        subject,
 		DNSNames:       csr.DNSNames,
 		IPAddresses:    csr.IPAddresses,
 		URIs:           csr.URIs,
@@ -299,9 +326,8 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 		NotBefore: notBefore,
 		NotAfter:  notAfter,
 
-		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,               // Sensible default for TLS
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}, // Sensible default for TLS
-		// TODO: Potentially use cfg.CertificatePolicies.AllowedKeyUsages/AllowedExtKeyUsages
+		KeyUsage:    combinedKeyUsage,
+		ExtKeyUsage: s.cfg.CertificatePolicies.AllowedExtKeyUsages, // Set directly from config policy
 
 		BasicConstraintsValid: true,
 		IsCA:                  false, // End-entity certificate
@@ -313,7 +339,7 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 		IssuingCertificateURL: s.cfg.IssuingCertificateURL,
 		CRLDistributionPoints: s.cfg.CRLDistributionPoints,
 	}
-	l.Debug("Constructed certificate template", zap.Any("template", template)) // Be careful logging templates
+	l.Debug("Constructed certificate template", zap.Any("template", template))
 
 	// 6. Sign the certificate using CA key
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, s.caCert, csr.PublicKey, s.caKey)
@@ -325,7 +351,6 @@ func (s *Service) SignCSR(ctx context.Context, csr *x509.CertificateRequest, lif
 	// 7. Parse and return the signed certificate
 	cert, err := x509.ParseCertificate(derBytes)
 	if err != nil {
-		// This should be highly unlikely if CreateCertificate succeeded
 		l.Error("Failed to parse newly created certificate DER bytes", zap.Error(err))
 		return nil, fmt.Errorf("failed to parse created certificate: %w", err)
 	}

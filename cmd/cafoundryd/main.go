@@ -16,8 +16,10 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/blockadesystems/cafoundry/internal/acme"
+	"github.com/blockadesystems/cafoundry/internal/auth"
 	"github.com/blockadesystems/cafoundry/internal/ca"
 	"github.com/blockadesystems/cafoundry/internal/config"
+	"github.com/blockadesystems/cafoundry/internal/management"
 	"github.com/blockadesystems/cafoundry/internal/storage"
 )
 
@@ -132,22 +134,12 @@ func main() {
 	// ACME HTTP-01 Challenge Endpoint MUST be on HTTP instance
 	httpInstance.GET("/.well-known/acme-challenge/:token", acme.HandleHTTP01Challenge)
 
-	e := echo.New()
-	e.HideBanner = true
-	e.Use(middleware.Recover())
-
-	// Add Request ID middleware
-	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
-		Generator: func() string {
-			return uuid.NewString()
-		},
-	}))
-
 	// --- Define HTTPS Routes ---
 	// Root handler (optional on HTTPS)
 	httpsInstance.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "CA Foundry is running (HTTPS)")
 	})
+
 	// ACME protocol endpoints MUST be on HTTPS instance
 	acmeGroup := httpsInstance.Group("/acme")
 	acmeGroup.GET("/directory", acme.HandleDirectory)
@@ -162,6 +154,31 @@ func main() {
 	acmeGroup.POST("/finalize/:orderID", acme.HandleFinalize)
 	acmeGroup.POST("/cert/:certID", acme.HandleCertificate)
 	acmeGroup.POST("/revoke-cert", acme.HandleRevokeCertificate)
+
+	// --- Management API Endpoints (on httpsInstance) ---
+	apiGroup := httpsInstance.Group("/api/v1")
+	// Define required role for management actions
+	// TODO: Make this role configurable?
+	const policyAdminRole = "admin"
+
+	// Create middleware instance requiring the admin role
+	adminOnlyMiddleware := auth.APIKeyAuthMiddleware(store, policyAdminRole)
+
+	// Apply auth middleware to the policy subgroup
+	policyGroup := apiGroup.Group("/policy")
+	policyGroup.Use(adminOnlyMiddleware)
+
+	// Suffix management routes
+	policyGroup.POST("/suffixes", management.HandleAddSuffix)
+	policyGroup.GET("/suffixes", management.HandleListSuffixes)
+	policyGroup.DELETE("/suffixes/:suffix", management.HandleDeleteSuffix)
+
+	// Domain management routes
+	policyGroup.POST("/domains", management.HandleAddDomain)
+	policyGroup.GET("/domains", management.HandleListDomains)
+	policyGroup.DELETE("/domains/:domain", management.HandleDeleteDomain)
+
+	// TODO: Add endpoints for managing API keys themselves?
 
 	// Start HTTP server and HTTPS server
 	// --- Start Servers in Goroutines ---

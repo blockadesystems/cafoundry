@@ -91,6 +91,17 @@ type Storage interface {
 	GetChallengeByToken(ctx context.Context, token string) (*model.Challenge, error)
 	GetChallengesByAuthorizationID(ctx context.Context, authzID string) ([]*model.Challenge, error)
 
+	// --- Policy Methods ---
+	AddAllowedDomain(ctx context.Context, domain string) error
+	DeleteAllowedDomain(ctx context.Context, domain string) error
+	ListAllowedDomains(ctx context.Context) ([]string, error)
+	IsDomainAllowed(ctx context.Context, domain string) (bool, error) // Checks exact match OR suffix match
+
+	AddAllowedSuffix(ctx context.Context, suffix string) error
+	DeleteAllowedSuffix(ctx context.Context, suffix string) error
+	ListAllowedSuffixes(ctx context.Context) ([]string, error)
+	// IsSuffixAllowed helper might not be needed if IsDomainAllowed handles it
+
 	// Transaction Helper (only implemented on PostgreSQLStorage)
 	WithinTransaction(ctx context.Context, fn func(ctx context.Context, txStorage Storage) error) error
 
@@ -206,6 +217,8 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_acme_authorizations_order_id ON acme_authorizations (order_id);`,
 		`CREATE TABLE IF NOT EXISTS acme_challenges ( id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL, type TEXT NOT NULL, status TEXT NOT NULL, token TEXT NOT NULL UNIQUE, validated_at TIMESTAMP WITH TIME ZONE, error_json JSONB, created_at TIMESTAMP WITH TIME ZONE NOT NULL );`,
 		`CREATE INDEX IF NOT EXISTS idx_acme_challenges_authorization_id ON acme_challenges (authorization_id);`,
+		`CREATE TABLE IF NOT EXISTS policy_allowed_domains (domain TEXT PRIMARY KEY, added_at TIMESTAMP WITH TIME ZONE DEFAULT NOW());`,
+		`CREATE TABLE IF NOT EXISTS policy_allowed_suffixes (suffix TEXT PRIMARY KEY, added_at TIMESTAMP WITH TIME ZONE DEFAULT NOW());`,
 	}
 
 	logger.Info("Executing CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS statements...")
@@ -321,6 +334,57 @@ func (s *PostgreSQLStorage) SaveCACertificate(ctx context.Context, certBytes []b
 }
 func (s *PostgreSQLStorage) GetCACertificate(ctx context.Context) ([]byte, error) {
 	return getCACertificate(ctx, s.db)
+}
+
+// --- Policy Methods ---
+func (s *PostgreSQLStorage) AddAllowedDomain(ctx context.Context, domain string) error {
+	return addAllowedDomain(ctx, s.db, domain)
+}
+func (s *PostgreSQLStorage) DeleteAllowedDomain(ctx context.Context, domain string) error {
+	return deleteAllowedDomain(ctx, s.db, domain)
+}
+func (s *PostgreSQLStorage) ListAllowedDomains(ctx context.Context) ([]string, error) {
+	return listAllowedDomains(ctx, s.db)
+}
+func (s *PostgreSQLStorage) IsDomainAllowed(ctx context.Context, domain string) (bool, error) {
+	return isDomainAllowed(ctx, s.db, domain)
+}
+func (s *PostgreSQLStorage) AddAllowedSuffix(ctx context.Context, suffix string) error {
+	return addAllowedSuffix(ctx, s.db, suffix)
+}
+func (s *PostgreSQLStorage) DeleteAllowedSuffix(ctx context.Context, suffix string) error {
+	return deleteAllowedSuffix(ctx, s.db, suffix)
+}
+func (s *PostgreSQLStorage) ListAllowedSuffixes(ctx context.Context) ([]string, error) {
+	return listAllowedSuffixes(ctx, s.db)
+}
+
+// =============================================
+// postgresTxStore Method Implementations (Add Policy methods)
+// =============================================
+// ... (Implementations for CA, CertData, User/API, ACME resources) ...
+
+// --- Policy Methods ---
+func (s *postgresTxStore) AddAllowedDomain(ctx context.Context, domain string) error {
+	return addAllowedDomain(ctx, s.tx, domain)
+}
+func (s *postgresTxStore) DeleteAllowedDomain(ctx context.Context, domain string) error {
+	return deleteAllowedDomain(ctx, s.tx, domain)
+}
+func (s *postgresTxStore) ListAllowedDomains(ctx context.Context) ([]string, error) {
+	return listAllowedDomains(ctx, s.tx)
+}
+func (s *postgresTxStore) IsDomainAllowed(ctx context.Context, domain string) (bool, error) {
+	return isDomainAllowed(ctx, s.tx, domain)
+}
+func (s *postgresTxStore) AddAllowedSuffix(ctx context.Context, suffix string) error {
+	return addAllowedSuffix(ctx, s.tx, suffix)
+}
+func (s *postgresTxStore) DeleteAllowedSuffix(ctx context.Context, suffix string) error {
+	return deleteAllowedSuffix(ctx, s.tx, suffix)
+}
+func (s *postgresTxStore) ListAllowedSuffixes(ctx context.Context) ([]string, error) {
+	return listAllowedSuffixes(ctx, s.tx)
 }
 
 // --- Certificate Data ---
@@ -1293,6 +1357,157 @@ func getChallengesByAuthorizationID(ctx context.Context, q Querier, authzID stri
 		return nil, fmt.Errorf("storage: error iterating challenge rows for authorization '%s': %w", authzID, err)
 	}
 	return challenges, nil
+}
+
+// --- Policy Helpers ---
+
+func addAllowedDomain(ctx context.Context, q Querier, domain string) error {
+	normDomain := strings.ToLower(strings.TrimSpace(domain))
+	if normDomain == "" {
+		return errors.New("storage: allowed domain cannot be empty")
+	}
+	query := `INSERT INTO policy_allowed_domains (domain, added_at) VALUES ($1, NOW()) ON CONFLICT (domain) DO NOTHING`
+	_, err := q.ExecContext(ctx, query, normDomain)
+	if err != nil {
+		return fmt.Errorf("storage: failed to add allowed domain '%s': %w", normDomain, err)
+	}
+	logger.Debug("Added/updated allowed domain", zap.String("domain", normDomain))
+	return nil
+}
+
+func deleteAllowedDomain(ctx context.Context, q Querier, domain string) error {
+	normDomain := strings.ToLower(strings.TrimSpace(domain))
+	if normDomain == "" {
+		return errors.New("storage: domain to delete cannot be empty")
+	}
+	query := `DELETE FROM policy_allowed_domains WHERE domain = $1`
+	res, err := q.ExecContext(ctx, query, normDomain)
+	if err != nil {
+		return fmt.Errorf("storage: failed to delete allowed domain '%s': %w", normDomain, err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn("DeleteAllowedDomain affected 0 rows", zap.String("domain", normDomain))
+	}
+	logger.Info("Attempted to delete allowed domain", zap.String("domain", normDomain), zap.Int64("rowsAffected", rowsAffected))
+	return nil
+}
+
+func listAllowedDomains(ctx context.Context, q Querier) ([]string, error) {
+	query := `SELECT domain FROM policy_allowed_domains ORDER BY domain ASC`
+	rows, err := q.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to query allowed domains: %w", err)
+	}
+	defer rows.Close()
+	domains := make([]string, 0)
+	for rows.Next() {
+		var domain string
+		if err := rows.Scan(&domain); err != nil {
+			return nil, fmt.Errorf("storage: failed to scan allowed domain row: %w", err)
+		}
+		domains = append(domains, domain)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating allowed domain rows: %w", err)
+	}
+	return domains, nil
+}
+
+func addAllowedSuffix(ctx context.Context, q Querier, suffix string) error {
+	// Normalize: lowercase, remove leading/trailing space, remove leading dot if present
+	normSuffix := strings.ToLower(strings.TrimSpace(suffix))
+	normSuffix = strings.TrimPrefix(normSuffix, ".")
+	if normSuffix == "" {
+		return errors.New("storage: allowed suffix cannot be empty")
+	}
+
+	query := `INSERT INTO policy_allowed_suffixes (suffix, added_at) VALUES ($1, NOW()) ON CONFLICT (suffix) DO NOTHING`
+	_, err := q.ExecContext(ctx, query, normSuffix)
+	if err != nil {
+		return fmt.Errorf("storage: failed to add allowed suffix '%s': %w", normSuffix, err)
+	}
+	logger.Debug("Added/updated allowed suffix", zap.String("suffix", normSuffix))
+	return nil
+}
+
+func deleteAllowedSuffix(ctx context.Context, q Querier, suffix string) error {
+	normSuffix := strings.ToLower(strings.TrimSpace(suffix))
+	normSuffix = strings.TrimPrefix(normSuffix, ".")
+	if normSuffix == "" {
+		return errors.New("storage: suffix to delete cannot be empty")
+	}
+	query := `DELETE FROM policy_allowed_suffixes WHERE suffix = $1`
+	res, err := q.ExecContext(ctx, query, normSuffix)
+	if err != nil {
+		return fmt.Errorf("storage: failed to delete allowed suffix '%s': %w", normSuffix, err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn("DeleteAllowedSuffix affected 0 rows", zap.String("suffix", normSuffix))
+	}
+	logger.Info("Attempted to delete allowed suffix", zap.String("suffix", normSuffix), zap.Int64("rowsAffected", rowsAffected))
+	return nil
+}
+
+func listAllowedSuffixes(ctx context.Context, q Querier) ([]string, error) {
+	query := `SELECT suffix FROM policy_allowed_suffixes ORDER BY suffix ASC`
+	rows, err := q.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to query allowed suffixes: %w", err)
+	}
+	defer rows.Close()
+	suffixes := make([]string, 0)
+	for rows.Next() {
+		var suffix string
+		if err := rows.Scan(&suffix); err != nil {
+			return nil, fmt.Errorf("storage: failed to scan allowed suffix row: %w", err)
+		}
+		suffixes = append(suffixes, suffix)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating allowed suffix rows: %w", err)
+	}
+	return suffixes, nil
+}
+
+// isDomainAllowed checks if a domain exactly matches an allowed domain OR is a subdomain of an allowed suffix.
+func isDomainAllowed(ctx context.Context, q Querier, domain string) (bool, error) {
+	normDomain := strings.ToLower(strings.TrimSpace(domain))
+	if normDomain == "" {
+		return false, errors.New("domain cannot be empty")
+	}
+
+	// 1. Check for exact match
+	queryExact := `SELECT 1 FROM policy_allowed_domains WHERE domain = $1 LIMIT 1`
+	var dummy int
+	err := q.QueryRowContext(ctx, queryExact, normDomain).Scan(&dummy)
+	if err == nil {
+		// Exact match found
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		// Database error during exact match check
+		return false, fmt.Errorf("storage: error checking exact domain match for '%s': %w", normDomain, err)
+	}
+	// No exact match found, continue to check suffixes...
+
+	// 2. Fetch all allowed suffixes
+	suffixes, err := listAllowedSuffixes(ctx, q)
+	if err != nil {
+		return false, fmt.Errorf("storage: failed to retrieve suffixes for domain check '%s': %w", normDomain, err)
+	}
+
+	// 3. Check if domain matches any suffix
+	for _, suffix := range suffixes {
+		// Check if domain is the suffix itself OR ends with ".suffix"
+		if normDomain == suffix || strings.HasSuffix(normDomain, "."+suffix) {
+			return true, nil
+		}
+	}
+
+	// 4. No exact or suffix match found
+	return false, nil
 }
 
 // --- Helper Functions ---

@@ -1025,22 +1025,41 @@ func HandleChallenge(c echo.Context) error {
 	go performValidation(cfg, store, account, authz, chal, reqLogger)
 
 	// Generate response nonce FIRST (before returning response)
-	respNonceValue, _ := generateNonceValue() // Error handled below
-	if respNonceValue != "" {
+	// respNonceValue, _ := generateNonceValue() // Error handled below
+	// if respNonceValue != "" {
+	// 	now := time.Now()
+	// 	respNonce := model.Nonce{Value: respNonceValue, IssuedAt: now, ExpiresAt: now.Add(cfg.NonceLifetime)}
+	// 	// Use background context for saving response nonce? Or original context?
+	// 	// Using original might be okay if it hasn't expired yet.
+	// 	if err := store.SaveNonce(ctx, &respNonce); err != nil {
+	// 		logger.Error("Failed to save response nonce", zap.String("nonce", respNonceValue), zap.Error(err))
+	// 	} else {
+	// 		c.Response().Header().Set("Replay-Nonce", respNonceValue)
+	// 	}
+	// }
+	respNonceValue, err := generateNonceValue()
+	if err != nil {
+		// Log error, but still proceed to send response without nonce
+		logger.Error("Failed to generate response nonce value", zap.Error(err))
+	} else {
+		// Always set the header if nonce was generated
+		c.Response().Header().Set("Replay-Nonce", respNonceValue)
+		// Attempt to save the nonce, but log error non-fatally if it fails
 		now := time.Now()
 		respNonce := model.Nonce{Value: respNonceValue, IssuedAt: now, ExpiresAt: now.Add(cfg.NonceLifetime)}
-		// Use background context for saving response nonce? Or original context?
-		// Using original might be okay if it hasn't expired yet.
 		if err := store.SaveNonce(ctx, &respNonce); err != nil {
-			logger.Error("Failed to save response nonce", zap.String("nonce", respNonceValue), zap.Error(err))
-		} else {
-			c.Response().Header().Set("Replay-Nonce", respNonceValue)
+			// Log the specific pq error here for investigation, but DO NOT prevent response/header
+			logger.Error("Failed to save response nonce (non-fatal for response header)",
+				zap.String("nonce", respNonceValue),
+				zap.Error(err), // This will contain the "pq: bind message..." error
+			)
 		}
 	}
 
 	chal.URL = fmt.Sprintf("%s/acme/chall/%s", cfg.ExternalURL, chal.ID)   // Populate URL for response
 	authzURL := fmt.Sprintf("%s/acme/authz/%s", cfg.ExternalURL, authz.ID) // authz object is available from earlier fetch
 	c.Response().Header().Set("Link", fmt.Sprintf("<%s>;rel=\"up\"", authzURL))
+
 	return c.JSON(http.StatusOK, chal) // Respond with challenge in "processing" state
 }
 
