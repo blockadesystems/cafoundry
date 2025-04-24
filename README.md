@@ -185,16 +185,15 @@ curl -k -X DELETE -H "Authorization: Bearer <span class="math-inline">\{API\_KEY
 (Note: -k skips TLS verification for self-signed HTTPS certs)
 
 ## TODO / Future Work
-
-    Testing: Comprehensive integration tests (Pebble, Certbot for DNS-01), unit tests.
-    Policy Enforcement: Implement Key Type/Size checks, CAA checks in ca.SignCSR. Add API endpoints for managing these policies.
-    CRL/OCSP: Implement CRL serving endpoint and periodic generation. Implement OCSP responder.
-    API Key Management API: Add API endpoints (protected by admin key) to list/delete API keys.
-    Hardening: Rate limiting, security audits, refined error handling.
-    ACME Features: Authorization Deactivation, Key Change.
-    Configuration: Support config files (YAML/TOML).
-    Observability: Metrics, tracing.
-    Documentation: Expand details.
+- Testing: Comprehensive integration tests (Pebble, Certbot for DNS-01), unit tests.
+- Policy Enforcement: Implement Key Type/Size checks, CAA checks in ca.SignCSR. Add API endpoints for managing these policies.
+- CRL/OCSP: Implement CRL serving endpoint and periodic generation. Implement OCSP responder.
+- API Key Management API: Add API endpoints (protected by admin key) to list/delete API keys.
+- Hardening: Rate limiting, security audits, refined error handling.
+- ACME Features: Authorization Deactivation, Key Change.
+- Configuration: Support config files (YAML/TOML).
+- Observability: Metrics, tracing.
+- Documentation: Expand details.
 
 ## Contributing
 
