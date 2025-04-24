@@ -39,9 +39,17 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
+// APIKeyInfo holds non-sensitive info about an API key for listing.
+type APIKeyInfo struct {
+	KeyPrefix   string    `json:"key_prefix"`
+	Description string    `json:"description"`
+	Roles       []string  `json:"roles"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 // Storage defines the interface for storing and retrieving CA and ACME data.
 type Storage interface {
-	// CA Data Methods
+	// --- CA Data Methods --- (as before)
 	SaveCRL(ctx context.Context, crlBytes []byte) error
 	GetLatestCRL(ctx context.Context) ([]byte, error)
 	SaveCAPrivateKey(ctx context.Context, keyBytes []byte) error
@@ -49,63 +57,62 @@ type Storage interface {
 	SaveCACertificate(ctx context.Context, certBytes []byte) error
 	GetCACertificate(ctx context.Context) ([]byte, error)
 
-	// Certificate Data Methods
+	// --- Certificate Data Methods --- (as before)
 	SaveCertificateData(ctx context.Context, certData *model.CertificateData) error
 	GetCertificateData(ctx context.Context, serialNumber string) (*model.CertificateData, error)
 	UpdateCertificateRevocation(ctx context.Context, serialNumber string, revoked bool, revokedAt time.Time, reasonCode int) error
 	ListRevokedCertificates(ctx context.Context) ([]*model.CertificateData, error)
 
-	// User/API Key Methods
-	SaveUser(ctx context.Context, username string, password string, roles []string) error // UPSERT
-	GetUser(ctx context.Context, username string) (string, []string, error)
-	SaveAPIKey(ctx context.Context, apiKey string, roles []string) error // UPSERT
-	GetAPIKey(ctx context.Context, apiKey string) ([]string, error)
-	AddUser(ctx context.Context, username string, password string, roles []string) error    // INSERT only
-	UpdateUser(ctx context.Context, username string, password string, roles []string) error // UPDATE only
-	DeleteUser(ctx context.Context, username string) error
-	ListUsers(ctx context.Context) (map[string][]string, error)
+	// --- API Key Methods (Refactored for Hashing) ---
+	// SaveHashedAPIKey(ctx context.Context, keyHash string, keyPrefix string, description string, roles []string) error // UPSERT based on hash
+	// GetAPIKeyRolesByHash(ctx context.Context, keyHash string) ([]string, error)
+	// DeleteAPIKeyByHash(ctx context.Context, keyHash string) error
+	// ListAPIKeysInfo(ctx context.Context) ([]APIKeyInfo, error) // Return non-sensitive info
+	SaveSaltedAPIKey(ctx context.Context, keyPrefix string, saltHex string, keyHashHex string, description string, roles []string) error // Use prefix as ID for UPSERT? Or add separate ID? Let's try UPSERT on hash.
+	// Method needed by Auth Middleware: Retrieve details needed for verification based on prefix
+	GetAPIKeyInfoByPrefix(ctx context.Context, keyPrefix string) (saltHex string, keyHashHex string, roles []string, description string, createdAt time.Time, err error)
+	DeleteAPIKeyByPrefix(ctx context.Context, keyPrefix string) error // Delete using prefix
+	ListAPIKeysInfo(ctx context.Context) ([]APIKeyInfo, error)        // Return non-sensitive info
 
-	// ACME Nonce Methods
+	// --- Policy Methods --- (as before)
+	AddAllowedDomain(ctx context.Context, domain string) error
+	DeleteAllowedDomain(ctx context.Context, domain string) error
+	ListAllowedDomains(ctx context.Context) ([]string, error)
+	IsDomainAllowed(ctx context.Context, domain string) (bool, error)
+	AddAllowedSuffix(ctx context.Context, suffix string) error
+	DeleteAllowedSuffix(ctx context.Context, suffix string) error
+	ListAllowedSuffixes(ctx context.Context) ([]string, error)
+
+	// --- ACME Nonce Methods --- (as before)
 	SaveNonce(ctx context.Context, nonce *model.Nonce) error
 	ConsumeNonce(ctx context.Context, nonceValue string) (*model.Nonce, error)
 	DeleteExpiredNonces(ctx context.Context) (int64, error)
 
-	// ACME Account Methods
+	// --- ACME Account Methods --- (as before)
 	SaveAccount(ctx context.Context, acc *model.Account) error
 	GetAccount(ctx context.Context, id string) (*model.Account, error)
 	GetAccountByKeyID(ctx context.Context, keyID string) (*model.Account, error)
 
-	// ACME Order Methods
+	// --- ACME Order Methods --- (as before)
 	SaveOrder(ctx context.Context, order *model.Order) error
 	GetOrder(ctx context.Context, id string) (*model.Order, error)
 	GetOrdersByAccountID(ctx context.Context, accountID string) ([]*model.Order, error)
 
-	// ACME Authorization Methods
+	// --- ACME Authorization Methods --- (as before)
 	SaveAuthorization(ctx context.Context, authz *model.Authorization) error
 	GetAuthorization(ctx context.Context, id string) (*model.Authorization, error)
 	GetAuthorizationsByOrderID(ctx context.Context, orderID string) ([]*model.Authorization, error)
 
-	// ACME Challenge Methods
+	// --- ACME Challenge Methods --- (as before)
 	SaveChallenge(ctx context.Context, chal *model.Challenge) error
 	GetChallenge(ctx context.Context, id string) (*model.Challenge, error)
 	GetChallengeByToken(ctx context.Context, token string) (*model.Challenge, error)
 	GetChallengesByAuthorizationID(ctx context.Context, authzID string) ([]*model.Challenge, error)
 
-	// --- Policy Methods ---
-	AddAllowedDomain(ctx context.Context, domain string) error
-	DeleteAllowedDomain(ctx context.Context, domain string) error
-	ListAllowedDomains(ctx context.Context) ([]string, error)
-	IsDomainAllowed(ctx context.Context, domain string) (bool, error) // Checks exact match OR suffix match
-
-	AddAllowedSuffix(ctx context.Context, suffix string) error
-	DeleteAllowedSuffix(ctx context.Context, suffix string) error
-	ListAllowedSuffixes(ctx context.Context) ([]string, error)
-	// IsSuffixAllowed helper might not be needed if IsDomainAllowed handles it
-
-	// Transaction Helper (only implemented on PostgreSQLStorage)
+	// Transaction Helper
 	WithinTransaction(ctx context.Context, fn func(ctx context.Context, txStorage Storage) error) error
 
-	Close() error // Close the underlying connection pool
+	Close() error
 }
 
 // --- PostgreSQL Implementation ---
@@ -199,8 +206,14 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS crls ( id SERIAL PRIMARY KEY, crl_data BYTEA NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() );`,
 		`CREATE TABLE IF NOT EXISTS ca_data ( id INTEGER PRIMARY KEY DEFAULT 1, key_data BYTEA, cert_data BYTEA, CONSTRAINT ca_data_single_row CHECK (id = 1) );`,
 		// User/API Key Tables
-		`CREATE TABLE IF NOT EXISTS users ( username TEXT PRIMARY KEY, password TEXT NOT NULL, roles TEXT[] NOT NULL );`,
-		`CREATE TABLE IF NOT EXISTS api_keys ( api_key TEXT PRIMARY KEY, roles TEXT[] NOT NULL );`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+            key_prefix TEXT PRIMARY KEY,         -- Use first 8 chars of key as unique ID for lookup
+            key_salt TEXT NOT NULL,            -- Store salt as hex string
+            key_hash TEXT NOT NULL UNIQUE,     -- Store hex(sha256(salt + key)), ensure UNIQUE
+            description TEXT,
+            roles TEXT[] NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );`,
 		// ACME Tables
 		`CREATE TABLE IF NOT EXISTS acme_nonces ( value TEXT PRIMARY KEY, expires_at TIMESTAMP WITH TIME ZONE NOT NULL, issued_at TIMESTAMP WITH TIME ZONE NOT NULL );`,
 		`CREATE INDEX IF NOT EXISTS idx_acme_nonces_expires_at ON acme_nonces (expires_at);`,
@@ -402,29 +415,73 @@ func (s *PostgreSQLStorage) ListRevokedCertificates(ctx context.Context) ([]*mod
 }
 
 // --- User/API Key ---
-func (s *PostgreSQLStorage) SaveUser(ctx context.Context, username string, password string, roles []string) error {
-	return saveUser(ctx, s.db, username, password, roles)
+func (s *PostgreSQLStorage) SaveHashedAPIKey(ctx context.Context, keyHash string, keyPrefix string, description string, roles []string) error {
+	return saveHashedAPIKey(ctx, s.db, keyHash, keyPrefix, description, roles)
 }
-func (s *PostgreSQLStorage) GetUser(ctx context.Context, username string) (string, []string, error) {
-	return getUser(ctx, s.db, username)
+func (s *postgresTxStore) SaveHashedAPIKey(ctx context.Context, keyHash string, keyPrefix string, description string, roles []string) error {
+	return saveHashedAPIKey(ctx, s.tx, keyHash, keyPrefix, description, roles)
 }
-func (s *PostgreSQLStorage) SaveAPIKey(ctx context.Context, apiKey string, roles []string) error {
-	return saveAPIKey(ctx, s.db, apiKey, roles)
+func saveHashedAPIKey(ctx context.Context, q Querier, keyHash string, keyPrefix string, description string, roles []string) error {
+	query := `
+        INSERT INTO api_keys (key_hash, key_prefix, description, roles, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (key_hash) DO UPDATE SET
+            key_prefix = EXCLUDED.key_prefix,
+            description = EXCLUDED.description,
+            roles = EXCLUDED.roles`
+	// Do not update created_at on conflict
+	var sqlDesc sql.NullString
+	if description != "" {
+		sqlDesc = sql.NullString{String: description, Valid: true}
+	}
+	_, err := q.ExecContext(ctx, query, keyHash, keyPrefix, sqlDesc, pq.Array(roles))
+	if err != nil {
+		// Don't log hash itself
+		return fmt.Errorf("storage: failed to save API key with prefix '%s': %w", keyPrefix, err)
+	}
+	logger.Info("API key saved/updated", zap.String("prefix", keyPrefix), zap.Strings("roles", roles))
+	return nil
 }
-func (s *PostgreSQLStorage) GetAPIKey(ctx context.Context, apiKey string) ([]string, error) {
-	return getAPIKey(ctx, s.db, apiKey)
+
+func (s *PostgreSQLStorage) GetAPIKeyRolesByHash(ctx context.Context, keyHash string) ([]string, error) {
+	return getAPIKeyRolesByHash(ctx, s.db, keyHash)
 }
-func (s *PostgreSQLStorage) AddUser(ctx context.Context, username string, password string, roles []string) error {
-	return addUser(ctx, s.db, username, password, roles)
+func (s *postgresTxStore) GetAPIKeyRolesByHash(ctx context.Context, keyHash string) ([]string, error) {
+	return getAPIKeyRolesByHash(ctx, s.tx, keyHash)
 }
-func (s *PostgreSQLStorage) UpdateUser(ctx context.Context, username string, password string, roles []string) error {
-	return updateUser(ctx, s.db, username, password, roles)
+func getAPIKeyRolesByHash(ctx context.Context, q Querier, keyHash string) ([]string, error) {
+	query := `SELECT roles FROM api_keys WHERE key_hash = $1`
+	var roles pq.StringArray
+	err := q.QueryRowContext(ctx, query, keyHash).Scan(&roles)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		} // Key hash not found
+		// Don't log hash
+		return nil, fmt.Errorf("storage: failed to get API key by hash: %w", err)
+	}
+	logger.Debug("API key roles retrieved by hash")
+	return []string(roles), nil
 }
-func (s *PostgreSQLStorage) DeleteUser(ctx context.Context, username string) error {
-	return deleteUser(ctx, s.db, username)
+
+func (s *PostgreSQLStorage) DeleteAPIKeyByHash(ctx context.Context, keyHash string) error {
+	return deleteAPIKeyByHash(ctx, s.db, keyHash)
 }
-func (s *PostgreSQLStorage) ListUsers(ctx context.Context) (map[string][]string, error) {
-	return listUsers(ctx, s.db)
+func (s *postgresTxStore) DeleteAPIKeyByHash(ctx context.Context, keyHash string) error {
+	return deleteAPIKeyByHash(ctx, s.tx, keyHash)
+}
+func deleteAPIKeyByHash(ctx context.Context, q Querier, keyHash string) error {
+	query := `DELETE FROM api_keys WHERE key_hash = $1`
+	res, err := q.ExecContext(ctx, query, keyHash)
+	if err != nil {
+		return fmt.Errorf("storage: failed to delete API key by hash: %w", err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn("DeleteAPIKeyByHash affected 0 rows, key hash might not exist")
+	}
+	logger.Info("Attempted to delete API key by hash", zap.Int64("rowsAffected", rowsAffected))
+	return nil
 }
 
 // --- ACME Nonce ---
@@ -532,29 +589,128 @@ func (s *postgresTxStore) ListRevokedCertificates(ctx context.Context) ([]*model
 }
 
 // --- User/API Key ---
-func (s *postgresTxStore) SaveUser(ctx context.Context, username string, password string, roles []string) error {
-	return saveUser(ctx, s.tx, username, password, roles)
+// Note: We are using key_prefix as the primary means of lookup and deletion for simplicity.
+// This assumes prefixes will be unique enough for practical purposes (e.g., 8 chars from a 32-byte key).
+// A separate UUID identifier could be used for more robust uniqueness if needed.
+
+func (s *PostgreSQLStorage) SaveSaltedAPIKey(ctx context.Context, keyPrefix string, saltHex string, keyHashHex string, description string, roles []string) error {
+	return saveSaltedAPIKey(ctx, s.db, keyPrefix, saltHex, keyHashHex, description, roles)
 }
-func (s *postgresTxStore) GetUser(ctx context.Context, username string) (string, []string, error) {
-	return getUser(ctx, s.tx, username)
+func (s *postgresTxStore) SaveSaltedAPIKey(ctx context.Context, keyPrefix string, saltHex string, keyHashHex string, description string, roles []string) error {
+	return saveSaltedAPIKey(ctx, s.tx, keyPrefix, saltHex, keyHashHex, description, roles)
 }
-func (s *postgresTxStore) SaveAPIKey(ctx context.Context, apiKey string, roles []string) error {
-	return saveAPIKey(ctx, s.tx, apiKey, roles)
+func saveSaltedAPIKey(ctx context.Context, q Querier, keyPrefix string, saltHex string, keyHashHex string, description string, roles []string) error {
+	query := `
+        INSERT INTO api_keys (key_prefix, key_salt, key_hash, description, roles, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (key_prefix) DO UPDATE SET
+            key_salt = EXCLUDED.key_salt,
+            key_hash = EXCLUDED.key_hash,
+            description = EXCLUDED.description,
+            roles = EXCLUDED.roles`
+	// created_at is not updated on conflict
+
+	var sqlDesc sql.NullString
+	if description != "" {
+		sqlDesc = sql.NullString{String: description, Valid: true}
+	}
+
+	_, err := q.ExecContext(ctx, query, keyPrefix, saltHex, keyHashHex, sqlDesc, pq.Array(roles))
+	if err != nil {
+		// Check for unique hash violation
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			if strings.Contains(pqErr.Constraint, "api_keys_key_hash_key") { // Constraint name might vary slightly
+				logger.Error("API key hash collision detected", zap.String("prefix", keyPrefix))
+				// This should be astronomically rare with random keys and salts
+				return fmt.Errorf("storage: API key hash collision for prefix '%s'", keyPrefix)
+			}
+		}
+		return fmt.Errorf("storage: failed to save API key with prefix '%s': %w", keyPrefix, err)
+	}
+	logger.Info("API key saved/updated", zap.String("prefix", keyPrefix), zap.Strings("roles", roles))
+	return nil
 }
-func (s *postgresTxStore) GetAPIKey(ctx context.Context, apiKey string) ([]string, error) {
-	return getAPIKey(ctx, s.tx, apiKey)
+
+// GetAPIKeyInfoByPrefix fetches details needed to verify a key, using its prefix.
+func (s *PostgreSQLStorage) GetAPIKeyInfoByPrefix(ctx context.Context, keyPrefix string) (saltHex string, keyHashHex string, roles []string, description string, createdAt time.Time, err error) {
+	return getAPIKeyInfoByPrefix(ctx, s.db, keyPrefix)
 }
-func (s *postgresTxStore) AddUser(ctx context.Context, username string, password string, roles []string) error {
-	return addUser(ctx, s.tx, username, password, roles)
+func (s *postgresTxStore) GetAPIKeyInfoByPrefix(ctx context.Context, keyPrefix string) (saltHex string, keyHashHex string, roles []string, description string, createdAt time.Time, err error) {
+	return getAPIKeyInfoByPrefix(ctx, s.tx, keyPrefix)
 }
-func (s *postgresTxStore) UpdateUser(ctx context.Context, username string, password string, roles []string) error {
-	return updateUser(ctx, s.tx, username, password, roles)
+func getAPIKeyInfoByPrefix(ctx context.Context, q Querier, keyPrefix string) (saltHex string, keyHashHex string, roles []string, description string, createdAt time.Time, err error) {
+	query := `SELECT key_salt, key_hash, roles, description, created_at FROM api_keys WHERE key_prefix = $1`
+	var dbRoles pq.StringArray
+	var sqlDesc sql.NullString
+	err = q.QueryRowContext(ctx, query, keyPrefix).Scan(&saltHex, &keyHashHex, &dbRoles, &sqlDesc, &createdAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Key prefix not found, return nils and nil error
+			return "", "", nil, "", time.Time{}, nil
+		}
+		// Don't log prefix here as it might be sensitive in some contexts
+		return "", "", nil, "", time.Time{}, fmt.Errorf("storage: failed to get API key by prefix: %w", err)
+	}
+	if sqlDesc.Valid {
+		description = sqlDesc.String
+	}
+	roles = []string(dbRoles)
+	logger.Debug("API key info retrieved by prefix")
+	return // Return named variables
 }
-func (s *postgresTxStore) DeleteUser(ctx context.Context, username string) error {
-	return deleteUser(ctx, s.tx, username)
+
+func (s *PostgreSQLStorage) DeleteAPIKeyByPrefix(ctx context.Context, keyPrefix string) error {
+	return deleteAPIKeyByPrefix(ctx, s.db, keyPrefix)
 }
-func (s *postgresTxStore) ListUsers(ctx context.Context) (map[string][]string, error) {
-	return listUsers(ctx, s.tx)
+func (s *postgresTxStore) DeleteAPIKeyByPrefix(ctx context.Context, keyPrefix string) error {
+	return deleteAPIKeyByPrefix(ctx, s.tx, keyPrefix)
+}
+func deleteAPIKeyByPrefix(ctx context.Context, q Querier, keyPrefix string) error {
+	query := `DELETE FROM api_keys WHERE key_prefix = $1`
+	res, err := q.ExecContext(ctx, query, keyPrefix)
+	if err != nil {
+		return fmt.Errorf("storage: failed to delete API key by prefix '%s': %w", keyPrefix, err)
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn("DeleteAPIKeyByPrefix affected 0 rows, key prefix might not exist", zap.String("prefix", keyPrefix))
+	}
+	logger.Info("Attempted to delete API key by prefix", zap.String("prefix", keyPrefix), zap.Int64("rowsAffected", rowsAffected))
+	return nil
+}
+
+func (s *PostgreSQLStorage) ListAPIKeysInfo(ctx context.Context) ([]APIKeyInfo, error) {
+	return listAPIKeysInfo(ctx, s.db)
+}
+func (s *postgresTxStore) ListAPIKeysInfo(ctx context.Context) ([]APIKeyInfo, error) {
+	return listAPIKeysInfo(ctx, s.tx)
+}
+func listAPIKeysInfo(ctx context.Context, q Querier) ([]APIKeyInfo, error) {
+	query := `SELECT key_prefix, description, roles, created_at FROM api_keys ORDER BY created_at ASC`
+	rows, err := q.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("storage: failed to list API keys: %w", err)
+	}
+	defer rows.Close()
+	keys := make([]APIKeyInfo, 0)
+	for rows.Next() {
+		var info APIKeyInfo
+		var roles pq.StringArray
+		var sqlDesc sql.NullString
+		if err := rows.Scan(&info.KeyPrefix, &sqlDesc, &roles, &info.CreatedAt); err != nil {
+			return nil, fmt.Errorf("storage: failed to scan API key info row: %w", err)
+		}
+		if sqlDesc.Valid {
+			info.Description = sqlDesc.String
+		}
+		info.Roles = []string(roles)
+		keys = append(keys, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: error iterating API key info rows: %w", err)
+	}
+	logger.Debug("API Keys info listed", zap.Int("count", len(keys)))
+	return keys, nil
 }
 
 // --- ACME Nonce ---

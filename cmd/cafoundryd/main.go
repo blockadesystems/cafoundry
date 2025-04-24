@@ -2,9 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -61,13 +68,46 @@ func applyCommonMiddleware(e *echo.Echo, store storage.Storage, cfg *config.Conf
 	e.Use(middleware.Logger())
 }
 
+// Helper to generate secure API keys (e.g., 32 bytes -> 43 base64url chars)
+func generateAPIKey(byteLength int) (string, error) {
+	bytes := make([]byte, byteLength)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes), nil
+}
+
+// Helper to generate random salt
+func generateSalt(byteLength int) ([]byte, error) {
+	salt := make([]byte, byteLength)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	return salt, nil
+}
+
+// Helper to hash API key with salt
+func hashAPIKeyWithSaltBytes(saltBytes []byte, apiKeyPlaintext string) string {
+	hashInput := append(saltBytes, []byte(apiKeyPlaintext)...)
+	hashBytes := sha256.Sum256(hashInput)
+	return hex.EncodeToString(hashBytes[:])
+}
+
 func main() {
+	// --- Define Flags ---
+	createAPIKey := flag.Bool("create-api-key", false, "Create a new API key, print it, and exit.")
+	apiKeyRoles := flag.String("roles", "admin", "Comma-separated roles for new API key (e.g., admin,revoke)")
+	apiKeyDesc := flag.String("description", "", "(Optional) Description for new API key")
+	// configFilePath := flag.String("config", "", "(Optional) Path to config file (not implemented yet)")
+
+	flag.Parse() // Parse flags early
+
+	// --- Load Configuration ---
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logger.Fatal("failed to load configuration", zap.Error(err))
 		os.Exit(1)
 	}
-	logger.Info("CA Foundry starting...", zap.Any("configuration", cfg))
 
 	// Initialize storage
 	store, err := storage.NewStorage(
@@ -88,6 +128,75 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("storage initialized")
+
+	// --- Handle --create-api-key Flag ---
+	if *createAPIKey {
+		fmt.Println("Creating new API key...")
+		defer store.Close() // Close store connection if we exit here
+
+		rolesInput := strings.TrimSpace(*apiKeyRoles)
+		if rolesInput == "" {
+			fmt.Fprintln(os.Stderr, "Error: --roles flag cannot be empty.")
+			os.Exit(1)
+		}
+		roles := make([]string, 0)
+		for _, r := range strings.Split(rolesInput, ",") {
+			trimmed := strings.TrimSpace(r)
+			if trimmed != "" {
+				roles = append(roles, trimmed)
+			}
+		}
+		if len(roles) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: No valid roles specified.")
+			os.Exit(1)
+		}
+
+		// Generate Key
+		apiKeyPlaintext, err := generateAPIKey(32) // 32 bytes = 256 bits
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating API key: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Generate Salt (e.g., 16 bytes)
+		saltBytes, err := generateSalt(16)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating salt: %v\n", err)
+			os.Exit(1)
+		}
+		saltHex := hex.EncodeToString(saltBytes)
+
+		// Hash Key with Salt
+		keyHashHex := hashAPIKeyWithSaltBytes(saltBytes, apiKeyPlaintext)
+
+		// Generate Prefix (first 8 chars)
+		const keyPrefixLength = 8
+		if len(apiKeyPlaintext) <= keyPrefixLength {
+			fmt.Fprintf(os.Stderr, "Error: Generated key too short (this shouldn't happen)\n")
+			os.Exit(1)
+		}
+		keyPrefix := apiKeyPlaintext[:keyPrefixLength]
+
+		// Save Hashed Key, Salt, Prefix etc.
+		err = store.SaveSaltedAPIKey(context.Background(), keyPrefix, saltHex, keyHashHex, *apiKeyDesc, roles)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error saving API key to storage: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Print details - IMPORTANT: Only time plaintext key is shown!
+		fmt.Println("\n--- API Key Created Successfully ---")
+		fmt.Printf("Key Prefix:   %s\n", keyPrefix)
+		fmt.Printf("Description:  %s\n", *apiKeyDesc)
+		fmt.Printf("Roles:        %v\n", roles)
+		// fmt.Printf("Salt (Hex):   %s (Stored)\n", saltHex)       // Optional: Show salt?
+		// fmt.Printf("Key Hash (Hex): %s (Stored)\n", keyHashHex) // Optional: Show hash?
+		fmt.Printf("\nPLAINTEXT KEY (SAVE THIS NOW!): %s\n\n", apiKeyPlaintext)
+
+		os.Exit(0) // Exit after creating key
+	}
+
+	logger.Info("CA Foundry starting...", zap.Any("configuration", cfg))
 
 	// Make sure the data directory exists
 	if _, err := os.Stat(cfg.DataDir); os.IsNotExist(err) {
@@ -157,7 +266,7 @@ func main() {
 
 	// --- Management API Endpoints (on httpsInstance) ---
 	apiGroup := httpsInstance.Group("/api/v1")
-	// Define required role for management actions
+	// Define required role for managcement actions
 	// TODO: Make this role configurable?
 	const policyAdminRole = "admin"
 

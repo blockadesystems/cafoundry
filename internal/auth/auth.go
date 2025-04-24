@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -23,57 +26,83 @@ func init() {
 	logger = zap.L().With(zap.String("package", "auth"))
 }
 
+// Helper function to hash API key with salt for verification
+func hashAPIKeyWithSalt(saltHex string, apiKeyPlaintext string) (string, error) {
+	saltBytes, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return "", fmt.Errorf("invalid salt format: %w", err)
+	}
+	// Prepend salt to the key before hashing
+	hashInput := append(saltBytes, []byte(apiKeyPlaintext)...)
+	hashBytes := sha256.Sum256(hashInput)
+	return hex.EncodeToString(hashBytes[:]), nil
+}
+
 // APIKeyAuthMiddleware creates an Echo middleware function that authenticates requests
-// based on a Bearer API key and checks for a required role.
+// based on a Bearer API key (checking its salted hash) and checks for a required role.
 func APIKeyAuthMiddleware(store storage.Storage, requiredRole string) echo.MiddlewareFunc {
 	if store == nil {
-		// Safety check, should not happen if setup correctly in main.go
 		panic("auth: storage instance is nil in APIKeyAuthMiddleware")
 	}
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			// Get request-scoped logger from context if available, otherwise use package logger
-			reqLogger := logger // Default to package logger
+			reqLogger := logger
 			if ctxLogger, ok := c.Get("logger").(*zap.Logger); ok && ctxLogger != nil {
-				reqLogger = ctxLogger // Use request-scoped logger if present
+				reqLogger = ctxLogger
 			}
 
 			authHeader := c.Request().Header.Get("Authorization")
 			if authHeader == "" {
-				reqLogger.Warn("Missing Authorization header")
-				// Consider returning WWW-Authenticate header? Maybe not for API keys.
 				return echo.NewHTTPError(http.StatusUnauthorized, "Authorization header is required")
 			}
-
-			// Expecting "Bearer <api-key>"
 			headerParts := strings.SplitN(authHeader, " ", 2)
 			if len(headerParts) != 2 || strings.ToLower(headerParts[0]) != "bearer" {
-				reqLogger.Warn("Invalid Authorization header format")
 				return echo.NewHTTPError(http.StatusUnauthorized, "Authorization header format must be Bearer <token>")
 			}
-
-			apiKey := headerParts[1]
-			if apiKey == "" {
-				reqLogger.Warn("Empty API key provided in Authorization header")
+			apiKeyPlaintext := headerParts[1]
+			if apiKeyPlaintext == "" {
 				return echo.NewHTTPError(http.StatusUnauthorized, "API key cannot be empty")
 			}
 
-			// Use request context for storage operations
+			// --- Verification using Salted Hash ---
+			// 1. Extract Key Prefix (assuming prefix length is known, e.g., 8)
+			// TODO: Make prefix length configurable or store alongside hash? Let's use fixed 8.
+			const keyPrefixLength = 8
+			if len(apiKeyPlaintext) <= keyPrefixLength {
+				reqLogger.Warn("API key presented is too short", zap.Int("length", len(apiKeyPlaintext)))
+				return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API key")
+			}
+			keyPrefix := apiKeyPlaintext[:keyPrefixLength]
+
+			// 2. Fetch Salt, Hash, Roles by Prefix
 			ctx := c.Request().Context()
-			roles, err := store.GetAPIKey(ctx, apiKey)
+			saltHex, storedHashHex, roles, _, _, err := store.GetAPIKeyInfoByPrefix(ctx, keyPrefix)
 			if err != nil {
-				reqLogger.Error("Failed to retrieve API key from storage", zap.Error(err))
-				// Mask internal error details
+				reqLogger.Error("Failed to retrieve API key info by prefix", zap.String("prefix", keyPrefix), zap.Error(err))
 				return echo.NewHTTPError(http.StatusInternalServerError, "Failed to verify API key")
 			}
-			if roles == nil {
-				// Key not found in storage
-				reqLogger.Warn("Invalid API key presented")
+			if saltHex == "" || storedHashHex == "" {
+				// Key prefix not found in storage
+				reqLogger.Warn("Invalid API key presented (prefix not found)", zap.String("prefix", keyPrefix))
 				return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API key")
 			}
 
-			// Check if the required role is present
+			// 3. Compute Hash of incoming key using stored salt
+			incomingHashHex, err := hashAPIKeyWithSalt(saltHex, apiKeyPlaintext)
+			if err != nil {
+				reqLogger.Error("Failed to compute hash for incoming key", zap.String("prefix", keyPrefix), zap.Error(err))
+				return echo.NewHTTPError(http.StatusInternalServerError, "Failed to verify API key")
+			}
+
+			// 4. Compare Hashes (Constant Time)
+			if subtle.ConstantTimeCompare([]byte(incomingHashHex), []byte(storedHashHex)) != 1 {
+				// Hashes don't match
+				reqLogger.Warn("Invalid API key presented (hash mismatch)", zap.String("prefix", keyPrefix))
+				return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API key")
+			}
+
+			// 5. Check Roles
 			isAllowed := false
 			for _, role := range roles {
 				if role == requiredRole {
@@ -81,15 +110,15 @@ func APIKeyAuthMiddleware(store storage.Storage, requiredRole string) echo.Middl
 					break
 				}
 			}
-
 			if !isAllowed {
-				reqLogger.Warn("API key lacks required role", zap.String("required_role", requiredRole), zap.Strings("key_roles", roles))
+				reqLogger.Warn("API key lacks required role", zap.String("prefix", keyPrefix), zap.String("required_role", requiredRole), zap.Strings("key_roles", roles))
 				return echo.NewHTTPError(http.StatusForbidden, fmt.Sprintf("API key does not have required role: %s", requiredRole))
 			}
 
-			// Key is valid and has the required role, proceed to the next handler
-			reqLogger.Debug("API key authenticated successfully", zap.String("required_role", requiredRole))
-			// Optional: Add authenticated user/roles to context?
+			// Key is valid and has the required role
+			reqLogger.Debug("API key authenticated successfully via salted hash", zap.String("prefix", keyPrefix), zap.String("required_role", requiredRole))
+			// Optional: Add context info
+			// c.Set("auth_key_prefix", keyPrefix)
 			// c.Set("auth_roles", roles)
 			return next(c)
 		}

@@ -29,8 +29,6 @@ type Config struct {
 	DBCert                  string                  // PostgreSQL client certificate file
 	DBKey                   string                  // PostgreSQL client private key file
 	DBRootCert              string                  // PostgreSQL root CA certificate file
-	Users                   map[string]User         // User credentials and roles (Deprecated)
-	APIKeys                 map[string]APIKey       // API keys and their roles
 	CertificatePolicies     CertificatePolicies     // Certificate policies
 	HTTPSCertFile           string                  // Path to the HTTPS certificate file
 	HTTPSKeyFile            string                  // Path to the HTTPS private key file
@@ -54,12 +52,6 @@ type ACMEDirectoryMetaConfig struct {
 	WebsiteURL              string   `json:"website,omitempty"`
 	CaaIdentities           []string `json:"caaIdentities,omitempty"`           // Domain names the CA controls
 	ExternalAccountRequired bool     `json:"externalAccountRequired,omitempty"` // Typically false
-}
-
-// User defines a user with credentials and roles. (Deprecated)
-type User struct {
-	Password string
-	Roles    []string
 }
 
 // APIKey defines an API key and its associated roles.
@@ -111,16 +103,6 @@ const (
 	defaultDNSResolver         = ""             // "ip:port" for DNS resolver used for validation (127.0.0.1:8053, etc.)
 )
 
-var defaultAPIKeys = map[string]APIKey{
-	"issuer-api-key":  {Roles: []string{"issuer"}},
-	"revoker-api-key": {Roles: []string{"revoker"}},
-}
-
-var defaultUsers = map[string]User{ // Deprecated
-	"issuer":  {Password: "issuerpass", Roles: []string{"issuer"}},
-	"revoker": {Password: "revokerpass", Roles: []string{"revoker"}},
-}
-
 var defaultCertificatePolicies = CertificatePolicies{
 	DefaultValidityDays: 365,
 	AllowedKeyUsages:    []x509.KeyUsage{x509.KeyUsageDigitalSignature, x509.KeyUsageKeyEncipherment},
@@ -156,8 +138,6 @@ func LoadConfig() (*Config, error) {
 		DBCert:                  getEnv("CAFOUNDRY_DB_CERT", defaultDBCert),
 		DBKey:                   getEnv("CAFOUNDRY_DB_KEY", defaultDBKey),
 		DBRootCert:              getEnv("CAFOUNDRY_DB_ROOTCERT", defaultDBRootCert),
-		Users:                   defaultUsers,   // Deprecated
-		APIKeys:                 defaultAPIKeys, // Use API keys instead
 		CertificatePolicies:     defaultCertificatePolicies,
 		HTTPSCertFile:           getEnv("CAFOUNDRY_HTTPS_CERT_FILE", defaultHTTPSCertFile),
 		HTTPSKeyFile:            getEnv("CAFOUNDRY_HTTPS_KEY_FILE", defaultHTTPSKeyFile),
