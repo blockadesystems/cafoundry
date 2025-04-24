@@ -64,6 +64,9 @@ type CertificatePolicies struct {
 	DefaultValidityDays int                // Default validity period for certificates
 	AllowedKeyUsages    []x509.KeyUsage    // Allowed key usages
 	AllowedExtKeyUsages []x509.ExtKeyUsage // Allowed extended key usages
+	AllowedKeyTypes     []string           `json:"allowedKeyTypes"`    // Allowed key types (e.g., "RSA", "ECDSA", "Ed25519") - case-insensitive check
+	MinRSASize          int                `json:"minRsaSize"`         // Minimum RSA key size in bits
+	AllowedECDSACurves  []string           `json:"allowedEcdsaCurves"` // Allowed ECDSA curve names (e.g., "P256", "P384", "P521") - case-insensitive check
 }
 
 const (
@@ -101,12 +104,18 @@ const (
 	defaultOCSPUrls            = ""             // Comma-separated URLs
 	defaultIssuerUrls          = ""             // Comma-separated URLs
 	defaultDNSResolver         = ""             // "ip:port" for DNS resolver used for validation (127.0.0.1:8053, etc.)
+	defaultAllowedKeyTypes     = "RSA,ECDSA"    // Allow RSA and ECDSA by default
+	defaultMinRSASize          = 2048
+	defaultAllowedECDSACurves  = "P256,P384" // Allow P256 and P384 by default (P521 less common)
 )
 
 var defaultCertificatePolicies = CertificatePolicies{
 	DefaultValidityDays: 365,
 	AllowedKeyUsages:    []x509.KeyUsage{x509.KeyUsageDigitalSignature, x509.KeyUsageKeyEncipherment},
 	AllowedExtKeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	AllowedKeyTypes:     strings.Split(defaultAllowedKeyTypes, ","),
+	MinRSASize:          defaultMinRSASize,
+	AllowedECDSACurves:  strings.Split(defaultAllowedECDSACurves, ","),
 }
 
 // LoadConfig loads the CA configuration from environment variables or defaults.
@@ -117,6 +126,26 @@ func LoadConfig() (*Config, error) {
 	crlDPs := getEnvAsStringSlice("CAFOUNDRY_CRL_DP", defaultCRLDPs)
 	ocspUrls := getEnvAsStringSlice("CAFOUNDRY_OCSP_URL", defaultOCSPUrls)
 	issuerUrls := getEnvAsStringSlice("CAFOUNDRY_ISSUER_URL", defaultIssuerUrls)
+	allowedKeyTypes := getEnvAsStringSlice("CAFOUNDRY_POLICY_KEY_TYPES", defaultAllowedKeyTypes)
+	minRsaSize := getEnvAsInt("CAFOUNDRY_POLICY_MIN_RSA_SIZE", defaultMinRSASize)
+	allowedCurves := getEnvAsStringSlice("CAFOUNDRY_POLICY_ECDSA_CURVES", defaultAllowedECDSACurves)
+
+	// Populate CertificatePolicies with loaded/default values
+	certPolicies := defaultCertificatePolicies // Start with code defaults
+	if len(allowedKeyTypes) > 0 {              // Only override if env var is set and not empty
+		certPolicies.AllowedKeyTypes = allowedKeyTypes
+	}
+	// Ensure minimum RSA size isn't set ridiculously low
+	if minRsaSize >= 1024 { // Basic sanity check
+		certPolicies.MinRSASize = minRsaSize
+	} else {
+		log.Printf("Warning: Invalid or too small value for CAFOUNDRY_POLICY_MIN_RSA_SIZE (%d), using default: %d", minRsaSize, defaultMinRSASize)
+		certPolicies.MinRSASize = defaultMinRSASize
+	}
+	if len(allowedCurves) > 0 { // Only override if env var is set and not empty
+		certPolicies.AllowedECDSACurves = allowedCurves
+	}
+	// TODO: Load AllowedKeyUsages/ExtKeyUsages from env vars too?
 
 	cfg := &Config{
 		DataDir:                 getEnv("CAFOUNDRY_DATA_DIR", defaultDataDir),
@@ -138,7 +167,7 @@ func LoadConfig() (*Config, error) {
 		DBCert:                  getEnv("CAFOUNDRY_DB_CERT", defaultDBCert),
 		DBKey:                   getEnv("CAFOUNDRY_DB_KEY", defaultDBKey),
 		DBRootCert:              getEnv("CAFOUNDRY_DB_ROOTCERT", defaultDBRootCert),
-		CertificatePolicies:     defaultCertificatePolicies,
+		CertificatePolicies:     certPolicies,
 		HTTPSCertFile:           getEnv("CAFOUNDRY_HTTPS_CERT_FILE", defaultHTTPSCertFile),
 		HTTPSKeyFile:            getEnv("CAFOUNDRY_HTTPS_KEY_FILE", defaultHTTPSKeyFile),
 		HTTPSAddress:            getEnv("CAFOUNDRY_HTTPS_ADDRESS", defaultHTTPSAddress),
