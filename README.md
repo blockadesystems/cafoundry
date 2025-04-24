@@ -138,7 +138,9 @@ Set all required environment variables (especially DB connection and `CAFOUNDRY_
 
 ```bash
 ./cafoundryd
+```
 
+##
 Contributing
 
 Contributions are welcome! Please feel free to open issues or submit pull requests.
