@@ -140,7 +140,62 @@ Set all required environment variables (especially DB connection and `CAFOUNDRY_
 ./cafoundryd
 ```
 
-##
-Contributing
+The server will start listening on the configured HTTP and HTTPS addresses.
+Usage
+ACME Clients
 
-Contributions are welcome! Please feel free to open issues or submit pull requests.
+CA Foundry is designed to work with standard ACME v2 clients.
+
+    Trust: The client machine must trust the CA Foundry root certificate (ca.crt). This is typically stored in the database but might also be written to the CAFOUNDRY_DATA_DIR on first generation. Retrieve it and add it to the client's trust store or use the client's specific flag (e.g., certbot --cacert).
+    Server URL: Point your client to {CAFOUNDRY_EXTERNAL_URL}/acme/directory.
+    HTTPS Verification: If CA Foundry's own HTTPS certificate is self-signed, you may need to use a flag in your client to skip TLS verification (e.g., certbot --no-verify-ssl, curl -k).
+
+Example using Certbot:
+(See previous README example, ensuring --cacert points to your CA Foundry root cert PEM file)
+Management API
+
+Manage issuance policies (allowed domains/suffixes) via the REST API, typically requiring an API key with the "admin" role.
+
+    Authentication: Use the Authorization: Bearer <your_api_key> header.
+    Endpoints:
+        GET /api/v1/policy/suffixes: List allowed suffixes.
+        POST /api/v1/policy/suffixes (Body: {"suffix": ".yourdomain.com"}): Add an allowed suffix.
+        DELETE /api/v1/policy/suffixes/{suffix}: Delete an allowed suffix (e.g., DELETE /api/v1/policy/suffixes/.yourdomain.com - URL encode if needed).
+        GET /api/v1/policy/domains: List allowed exact domains.
+        POST /api/v1/policy/domains (Body: {"domain": "exact.yourdomain.com"}): Add an allowed domain.
+        DELETE /api/v1/policy/domains/{domain}: Delete an allowed domain.
+
+### Example using Curl:
+```bash
+API_KEY="your_saved_admin_plaintext_key"
+BASE_URL="https://localhost:8443" # Your CA Foundry External URL base
+
+# Add an allowed suffix
+curl -k -X POST -H "Authorization: Bearer <span class="math-inline">\{API\_KEY\}" \-H "Content\-Type\: application/json" \\
+\-d '\{"suffix"\: "internal\.lab"\}' \\
+"</span>{BASE_URL}/api/v1/policy/suffixes"
+
+# List allowed suffixes
+curl -k -X GET -H "Authorization: Bearer <span class="math-inline">\{API\_KEY\}" "</span>{BASE_URL}/api/v1/policy/suffixes"
+
+# Delete an allowed suffix (URL encode if suffix has special chars)
+curl -k -X DELETE -H "Authorization: Bearer <span class="math-inline">\{API\_KEY\}" "</span>{BASE_URL}/api/v1/policy/suffixes/internal.lab"
+```
+
+(Note: -k skips TLS verification for self-signed HTTPS certs)
+
+## TODO / Future Work
+
+    Testing: Comprehensive integration tests (Pebble, Certbot for DNS-01), unit tests.
+    Policy Enforcement: Implement Key Type/Size checks, CAA checks in ca.SignCSR. Add API endpoints for managing these policies.
+    CRL/OCSP: Implement CRL serving endpoint and periodic generation. Implement OCSP responder.
+    API Key Management API: Add API endpoints (protected by admin key) to list/delete API keys.
+    Hardening: Rate limiting, security audits, refined error handling.
+    ACME Features: Authorization Deactivation, Key Change.
+    Configuration: Support config files (YAML/TOML).
+    Observability: Metrics, tracing.
+    Documentation: Expand details.
+
+## Contributing
+
+Contributions are welcome! Please open issues for bugs or feature requests. Pull requests are also welcome, but please ensure they are well-tested and include documentation updates if necessary.
