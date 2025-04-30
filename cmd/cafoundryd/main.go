@@ -16,17 +16,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/blockadesystems/cafoundry/internal/acme"
-	"github.com/blockadesystems/cafoundry/internal/auth"
 	"github.com/blockadesystems/cafoundry/internal/ca"
 	"github.com/blockadesystems/cafoundry/internal/config"
-	"github.com/blockadesystems/cafoundry/internal/management"
+
+	"github.com/blockadesystems/cafoundry/internal/server"
 	"github.com/blockadesystems/cafoundry/internal/storage"
 )
 
@@ -40,32 +37,6 @@ func init() {
 		panic(err)
 	}
 	logger = l.With(zap.String("package", "main"))
-}
-
-// Helper to apply common middleware
-func applyCommonMiddleware(e *echo.Echo, store storage.Storage, cfg *config.Config, caService ca.CAService) {
-	e.HideBanner = true
-	e.Use(middleware.Recover())
-	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
-		Generator: func() string { return uuid.NewString() },
-	}))
-
-	// Middleware to set context values (logger, store, cfg, caService)
-	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			reqID := c.Response().Header().Get(echo.HeaderXRequestID)
-			// Use the global 'logger' as the base for the request logger
-			reqLogger := logger.With(zap.String("request_id", reqID))
-
-			c.Set("caService", caService)
-			c.Set("cfg", cfg)
-			c.Set("store", store)
-			c.Set("logger", reqLogger) // Set request-scoped logger
-			return next(c)
-		}
-	})
-	// Add Echo's logger *after* request ID and our logger are set, if desired
-	e.Use(middleware.Logger())
 }
 
 // Helper to generate secure API keys (e.g., 32 bytes -> 43 base64url chars)
@@ -196,6 +167,7 @@ func main() {
 		os.Exit(0) // Exit after creating key
 	}
 
+	defer store.Close() // Defer store close for normal server run
 	logger.Info("CA Foundry starting...", zap.Any("configuration", cfg))
 
 	// Make sure the data directory exists
@@ -230,62 +202,11 @@ func main() {
 	httpsInstance := echo.New()
 	// --- Apply Common Middleware ---
 	// Apply middleware providing context values (store, logger, cfg, caService) to BOTH instances
-	applyCommonMiddleware(httpInstance, store, cfg, caService)
-	applyCommonMiddleware(httpsInstance, store, cfg, caService)
+	server.ApplyCommonMiddleware(httpInstance, store, cfg, caService, logger)
+	server.ApplyCommonMiddleware(httpsInstance, store, cfg, caService, logger)
 
 	// --- Define HTTP Routes ---
-	// Root handler (optional on HTTP)
-	httpInstance.GET("/", func(c echo.Context) error {
-		// Optional: Redirect to HTTPS?
-		// return c.Redirect(http.StatusMovedPermanently, "https://"+c.Request().Host+c.Request().RequestURI)
-		return c.String(http.StatusOK, "CA Foundry is running (HTTP)")
-	})
-	// ACME HTTP-01 Challenge Endpoint MUST be on HTTP instance
-	httpInstance.GET("/.well-known/acme-challenge/:token", acme.HandleHTTP01Challenge)
-
-	// --- Define HTTPS Routes ---
-	// Root handler (optional on HTTPS)
-	httpsInstance.GET("/", func(c echo.Context) error {
-		return c.String(http.StatusOK, "CA Foundry is running (HTTPS)")
-	})
-
-	// ACME protocol endpoints MUST be on HTTPS instance
-	acmeGroup := httpsInstance.Group("/acme")
-	acmeGroup.GET("/directory", acme.HandleDirectory)
-	acmeGroup.HEAD("/new-nonce", acme.HandleNewNonce) // HEAD before GET/POST usually
-	acmeGroup.GET("/new-nonce", acme.HandleNewNonce)  // Also allow GET for nonce
-	acmeGroup.POST("/new-account", acme.HandleNewAccount)
-	acmeGroup.POST("/account/:accountID", acme.HandleAccount)
-	acmeGroup.POST("/new-order", acme.HandleNewOrder)
-	acmeGroup.POST("/order/:orderID", acme.HandleGetOrder)      // POST-as-GET
-	acmeGroup.POST("/authz/:authzID", acme.HandleAuthorization) // POST-as-GET
-	acmeGroup.POST("/chall/:challengeID", acme.HandleChallenge)
-	acmeGroup.POST("/finalize/:orderID", acme.HandleFinalize)
-	acmeGroup.POST("/cert/:certID", acme.HandleCertificate)
-	acmeGroup.POST("/revoke-cert", acme.HandleRevokeCertificate)
-
-	// --- Management API Endpoints (on httpsInstance) ---
-	apiGroup := httpsInstance.Group("/api/v1")
-	// Define required role for managcement actions
-	// TODO: Make this role configurable?
-	const policyAdminRole = "admin"
-
-	// Create middleware instance requiring the admin role
-	adminOnlyMiddleware := auth.APIKeyAuthMiddleware(store, policyAdminRole)
-
-	// Apply auth middleware to the policy subgroup
-	policyGroup := apiGroup.Group("/policy")
-	policyGroup.Use(adminOnlyMiddleware)
-
-	// Suffix management routes
-	policyGroup.POST("/suffixes", management.HandleAddSuffix)
-	policyGroup.GET("/suffixes", management.HandleListSuffixes)
-	policyGroup.DELETE("/suffixes/:suffix", management.HandleDeleteSuffix)
-
-	// Domain management routes
-	policyGroup.POST("/domains", management.HandleAddDomain)
-	policyGroup.GET("/domains", management.HandleListDomains)
-	policyGroup.DELETE("/domains/:domain", management.HandleDeleteDomain)
+	server.SetupRouter(httpInstance, httpsInstance, store, cfg, caService)
 
 	// TODO: Add endpoints for managing API keys themselves?
 
