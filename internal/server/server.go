@@ -61,6 +61,7 @@ func SetupRouter(httpInstance, httpsInstance *echo.Echo, store storage.Storage, 
 	acmeGroup.GET("/directory", acme.HandleDirectory)
 	acmeGroup.HEAD("/new-nonce", acme.HandleNewNonce)
 	acmeGroup.GET("/new-nonce", acme.HandleNewNonce)
+	acmeGroup.POST("/new-nonce", acme.HandleNewNonce)
 	acmeGroup.POST("/new-account", acme.HandleNewAccount)
 	acmeGroup.POST("/account/:accountID", acme.HandleAccount)
 	acmeGroup.POST("/new-order", acme.HandleNewOrder)

@@ -73,34 +73,34 @@ type jwsVerifyResult struct {
 	ProtectedHeader jose.Header
 }
 
-// newAccountPayload represents the expected JSON body for a new account request.
-type newAccountPayload struct {
+// NewAccountPayload represents the expected JSON body for a new account request.
+type NewAccountPayload struct {
 	Contact                []string        `json:"contact"`
 	TermsOfServiceAgreed   bool            `json:"termsOfServiceAgreed"`
 	OnlyReturnExisting     bool            `json:"onlyReturnExisting"`
 	ExternalAccountBinding json.RawMessage `json:"externalAccountBinding,omitempty"`
 }
 
-// accountUpdatePayload represents the fields allowed in an account update request body.
-type accountUpdatePayload struct {
+// AccountUpdatePayload represents the fields allowed in an account update request body.
+type AccountUpdatePayload struct {
 	Contact *[]string `json:"contact,omitempty"`
 	Status  *string   `json:"status,omitempty"`
 }
 
-// newOrderPayload represents the expected JSON body for a new order request.
-type newOrderPayload struct {
+// NewOrderPayload represents the expected JSON body for a new order request.
+type NewOrderPayload struct {
 	Identifiers []model.Identifier `json:"identifiers"`
 	NotBefore   string             `json:"notBefore,omitempty"` // Use string initially for RFC3339 parsing
 	NotAfter    string             `json:"notAfter,omitempty"`  // Use string initially for RFC3339 parsing
 }
 
-// finalizePayload represents the JWS payload for a finalize request.
-type finalizePayload struct {
+// FinalizePayload represents the JWS payload for a finalize request.
+type FinalizePayload struct {
 	CSR string `json:"csr"` // Contains base64url-encoded DER CSR
 }
 
-// revokePayload represents the JWS payload for a certificate revocation request.
-type revokePayload struct {
+// RevokePayload represents the JWS payload for a certificate revocation request.
+type RevokePayload struct {
 	Certificate string `json:"certificate"`      // base64url(DER-encoded certificate)
 	Reason      *int   `json:"reason,omitempty"` // Optional CRL reason code
 }
@@ -437,7 +437,7 @@ func HandleNewAccount(c echo.Context) error {
 	}
 
 	// 2. Parse Payload
-	var payload newAccountPayload
+	var payload NewAccountPayload
 	if err := json.Unmarshal(jwsResult.Payload, &payload); err != nil {
 		logger.Warn("Failed to unmarshal new account payload", zap.Error(err))
 		return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid payload: "+err.Error())
@@ -551,7 +551,7 @@ func HandleAccount(c echo.Context) error {
 	logger = logger.With(zap.String("accountID", account.ID)) // Add accountID to logger
 
 	// 2. Parse Payload (optional)
-	var payload accountUpdatePayload
+	var payload AccountUpdatePayload
 	updateRequested := false
 	madeChanges := false
 	if c.Request().Header.Get(echo.HeaderContentLength) != "0" && len(jwsResult.Payload) > 0 {
@@ -643,7 +643,7 @@ func HandleNewOrder(c echo.Context) error {
 	logger = logger.With(zap.String("accountID", account.ID))
 
 	// 2. Parse Payload
-	var payload newOrderPayload
+	var payload NewOrderPayload
 	if err := json.Unmarshal(jwsResult.Payload, &payload); err != nil {
 		logger.Warn("Failed to unmarshal new order payload", zap.Error(err))
 		return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid payload: "+err.Error())
@@ -1558,7 +1558,7 @@ func HandleFinalize(c echo.Context) error {
 	}
 
 	// 3. Parse Payload (CSR)
-	var payload finalizePayload
+	var payload FinalizePayload
 	if err := json.Unmarshal(jwsResult.Payload, &payload); err != nil {
 		logger.Warn("Failed to unmarshal finalize payload", zap.Error(err))
 		return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid payload: "+err.Error())
@@ -1911,7 +1911,7 @@ func HandleRevokeCertificate(c echo.Context) error {
 		}
 
 		// Parse Payload first to get certificate for key comparison
-		var payload revokePayload
+		var payload RevokePayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid payload: "+err.Error())
 		}
@@ -1970,7 +1970,7 @@ func HandleRevokeCertificate(c echo.Context) error {
 		owningAccount = account // Store the account
 
 		// Parse Payload first to get certificate for ownership check
-		var payload revokePayload
+		var payload RevokePayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			return acmeError(c, http.StatusBadRequest, errTypeMalformed, "Invalid payload: "+err.Error())
 		}
@@ -2044,7 +2044,7 @@ func HandleRevokeCertificate(c echo.Context) error {
 
 	// 6. Perform Revocation via CA Service
 	// Re-parse payload to get reason code (needed because payloadBytes scope ends)
-	var payload revokePayload
+	var payload RevokePayload
 	_ = json.Unmarshal(payloadBytes, &payload) // Ignore error here, already parsed once
 	reason := defaultRevocationReason
 	if payload.Reason != nil {
